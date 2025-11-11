@@ -1,172 +1,240 @@
-// Web Worker for Audio Analysis (ROBUST MULTI-F0 + CQT Mode + Salience Rows)
+// Web Worker for Audio Analysis
+// Handles heavy FFT computations off the main thread
 
-let isProcessing=false, isCancelled=false;
+let isProcessing = false;
+let isCancelled = false;
 
-self.onmessage = (e)=>{
-  const {type, data} = e.data || {};
-  if (type === 'analyze') analyzeChunkRobust(data);
-  else if (type === 'cancel') isCancelled = true;
-  else if (type === 'reset') { isCancelled = false; isProcessing = false; }
+self.onmessage = function(e) {
+  const { type, data } = e.data;
+  
+  switch(type) {
+    case 'analyze':
+      analyzeChunk(data);
+      break;
+    case 'cancel':
+      isCancelled = true;
+      break;
+    case 'reset':
+      isCancelled = false;
+      isProcessing = false;
+      break;
+  }
 };
 
-function hannWindow(len){ const w=new Float32Array(len); const d=len-1; for(let i=0;i<len;i++) w[i]=0.5-0.5*Math.cos(2*Math.PI*i/d); return w; }
-function applyWindow(x,w){ const y=new Float32Array(x.length); for(let i=0;i<x.length;i++) y[i]=x[i]*w[i]; return y; }
-function rms(x){ let s=0; for(let i=0;i<x.length;i++) s+=x[i]*x[i]; return Math.sqrt(s/x.length); }
-function goertzelPower(frame, coeff){
-  let s0=0, s1=0, s2=0;
-  for (let i=0;i<frame.length;i++){ s0 = frame[i] + coeff*s1 - s2; s2 = s1; s1 = s0; }
-  const power = s1*s1 + s2*s2 - coeff*s1*s2;
-  return power / frame.length;
-}
-
-const MIDI_MIN=21, MIDI_MAX=108, A4=440;
-function midiToFreq(m){ return A4 * Math.pow(2, (m-69)/12); }
-
-function buildHarmonicTables(sampleRate, maxHarm, frameSize){
-  const nyq = sampleRate / 2;
-  const window = hannWindow(frameSize);
-  const tables = [];
-  for (let m=MIDI_MIN; m<=MIDI_MAX; m++){
-    const f0 = midiToFreq(m);
-    const hs = [];
-    for (let k=1; k<=maxHarm; k++){
-      const fk = f0*k; if (fk >= nyq) break;
-      const omega = 2*Math.PI*fk/sampleRate;
-      const coeff = 2*Math.cos(omega);
-      hs.push({k, coeff});
-    }
-    tables.push({m, f0, harmonics: hs});
+function analyzeChunk(data) {
+  const { audioData, sampleRate, chunkIndex, totalChunks, fftSize, threshold, timeOffset } = data;
+  
+  // Convert array back to Float32Array if needed
+  const audioArray = audioData instanceof Float32Array ? audioData : new Float32Array(audioData);
+  
+  if (isCancelled) {
+    self.postMessage({ type: 'cancelled' });
+    return;
   }
-  return { tables, window };
-}
-
-function analyzeChunkRobust(payload){
-  const { audioData, sampleRate, chunkIndex, totalChunks, fftSize, threshold, timeOffset, mode } = payload;
-  if (isCancelled){ self.postMessage({type:'cancelled'}); return; }
+  
   isProcessing = true;
-  try{
-    const audioArray = audioData instanceof Float32Array ? audioData : new Float32Array(audioData);
-
-    const isCQT = (mode === 'cqt');
-    const frameSize = Math.max(1024, isCQT ? Math.max(fftSize, 16384) : (fftSize|0));
-    const hopSize   = isCQT ? Math.max(128, Math.floor(frameSize/8)) : Math.floor(frameSize/2);
-    const maxHarm   = isCQT ? 8 : 6;
-
-    const { tables, window } = buildHarmonicTables(sampleRate, maxHarm, frameSize);
-
-    const t = Math.min(Math.max(threshold || 30, 10), 1000);
-    const alpha = Math.min(0.98, 0.15 + ((t-10)/990)*0.83);
-    const hysteresisDown = 0.82;
-    const maxPolyphony = 16;
-
-    const notesOut = [];
-    const salienceRows = [];
-
-    const numFrames = Math.max(0, Math.floor((audioArray.length - frameSize)/hopSize));
-
-    for (let f=0; f<numFrames; f++){
-      if (isCancelled){ self.postMessage({type:'cancelled'}); return; }
-      const start = f*hopSize;
-      const frame = applyWindow(audioArray.subarray(start, start+frameSize), window);
-      const frameRMS = rms(frame);
-      if (frameRMS < 1e-4){ 
-        salienceRows.push(new Uint8Array(MIDI_MAX-MIDI_MIN+1)); 
-        continue; 
+  
+  try {
+    // Perform FFT analysis on this chunk
+    const hopSize = Math.floor(fftSize / 2);
+    const notes = [];
+    const spectrumData = [];
+    
+    const numFrames = Math.floor((audioArray.length - fftSize) / hopSize);
+    
+    for (let frame = 0; frame < numFrames; frame++) {
+      if (isCancelled) {
+        self.postMessage({ type: 'cancelled' });
+        return;
       }
-
-      const sal = new Float32Array(MIDI_MAX-MIDI_MIN+1);
-      let maxSal = 0;
-      for (let idx=0; idx<tables.length; idx++){
-        const hs = tables[idx].harmonics;
-        let s = 0;
-        for (let h=0; h<hs.length; h++){
-          const {k, coeff} = hs[h];
-          s += (1/k) * goertzelPower(frame, coeff);
+      
+      const startSample = frame * hopSize;
+      const frameData = audioArray.slice(startSample, startSample + fftSize);
+      
+      // Apply Hanning window
+      const windowedData = applyHannWindow(frameData);
+      
+      // Perform FFT using optimized algorithm
+      const spectrum = fastFFT(windowedData);
+      
+      // Store spectrum data for visualization (downsample for efficiency)
+      if (frame % 4 === 0) {
+        spectrumData.push(spectrum.slice(0, Math.floor(spectrum.length / 4)));
+      }
+      
+      // Find peaks in spectrum
+      const peaks = findSpectralPeaks(spectrum, sampleRate, fftSize, threshold);
+      
+      // Convert peaks to notes
+      const time = timeOffset + (startSample / sampleRate);
+      
+      for (const peak of peaks) {
+        const frequency = peak.frequency;
+        const amplitude = peak.amplitude;
+        
+        // Convert frequency to MIDI note
+        const midiNote = frequencyToMIDI(frequency);
+        
+        if (midiNote >= 21 && midiNote <= 108) { // Piano range
+          const velocity = Math.min(127, Math.max(10, Math.floor(amplitude * 200)));
+          
+          notes.push({
+            time: time,
+            pitch: midiNote,
+            frequency: frequency,
+            velocity: velocity,
+            duration: 0.1
+          });
         }
-        sal[idx] = s; if (s > maxSal) maxSal = s;
-      }
-      if (maxSal <= 0){ salienceRows.push(new Uint8Array(MIDI_MAX-MIDI_MIN+1)); continue; }
-
-      // Whitening (median subtraction over ±2 semitones)
-      const salW = new Float32Array(sal.length);
-      for (let i=0;i<sal.length;i++){
-        let v0=sal[i], v1=sal[i-1]||sal[i], v2=sal[i+1]||sal[i];
-        let v3=sal[i-2]||sal[i], v4=sal[i+2]||sal[i];
-        const vals = [v0,v1,v2,v3,v4].sort((a,b)=>a-b);
-        const med = vals[2];
-        salW[i] = Math.max(0, sal[i] - 0.8*med);
-      }
-      let maxW = 0; for (let i=0;i<salW.length;i++) if (salW[i]>maxW) maxW = salW[i];
-      if (maxW <= 0){ salienceRows.push(new Uint8Array(MIDI_MAX-MIDI_MIN+1)); continue; }
-      const relThresh = alpha * maxW;
-
-      // Save normalized salience row (0..255)
-      const row = new Uint8Array(salW.length);
-      for (let i=0;i<salW.length;i++){ row[i] = Math.max(0, Math.min(255, Math.round(255 * salW[i]/maxW))); }
-      salienceRows.push(row);
-
-      // Iterative harmonic masking for polyphony
-      const masked = salW.slice();
-      const chosenIdx = [];
-      function isLocalPeak(arr,i){
-        const L=i>0?arr[i-1]:-Infinity, R=i<arr.length-1?arr[i+1]:-Infinity;
-        return arr[i]>=L && arr[i]>=R;
-      }
-      function maskSeries(idxBase){
-        const m0 = MIDI_MIN + idxBase;
-        for (let h=1; h<=maxHarm; h++){
-          const fH = midiToFreq(m0)*h;
-          const mH = 69 + 12*Math.log2(fH/A4);
-          const iH = Math.round(mH) - MIDI_MIN;
-          for (let d=-1; d<=1; d++){ const j=iH+d; if (j>=0 && j<masked.length) masked[j] *= 0.1; }
-        }
-        for (let d=-1; d<=1; d++){ const j=idxBase+d; if (j>=0 && j<masked.length) masked[j] *= 0.1; }
-      }
-      let picks=0;
-      while (picks < maxPolyphony){
-        let best=-1, bestVal=relThresh;
-        for (let i=0;i<masked.length;i++){
-          const v=masked[i];
-          if (v>bestVal && isLocalPeak(masked,i)){ best=i; bestVal=v; }
-        }
-        if (best<0) break;
-        chosenIdx.push(best);
-        maskSeries(best);
-        picks++;
-      }
-
-      // Parabolic interpolation (sub-semitone)
-      function refineFrac(arr,i){
-        const c=arr[i], l=i>0?arr[i-1]:c, r=i<arr.length-1?arr[i+1]:c;
-        const den=(l-2*c+r); if (den===0) return 0;
-        const delta=0.5*(l-r)/den; if (delta>1||delta<-1) return 0; return delta;
-      }
-
-      const time = timeOffset + start / sampleRate;
-      const frameDur = hopSize / sampleRate;
-      for (const idx of chosenIdx){
-        const midiBase = MIDI_MIN + idx;
-        const frac = refineFrac(salW, idx);
-        const midiRef = midiBase + frac;
-        const freq = midiToFreq(midiRef);
-        const velocity = Math.max(10, Math.min(127, 100));
-        notesOut.push({ time, pitch: Math.round(midiRef), frequency: freq, velocity, duration: frameDur });
       }
     }
-
-    self.postMessage({ 
-      type: 'progress', 
-      chunkIndex, 
-      totalChunks, 
-      notes: notesOut, 
-      salRows: salienceRows, 
-      hopSec: hopSize / sampleRate,
-      mode
+    
+    // Send results back to main thread
+    self.postMessage({
+      type: 'progress',
+      chunkIndex: chunkIndex,
+      totalChunks: totalChunks,
+      notes: notes,
+      spectrumData: spectrumData
     });
-
-  }catch(err){
-    self.postMessage({ type:'error', error: err?.message || String(err) });
-  } finally {
-    isProcessing = false;
+    
+  } catch (error) {
+    self.postMessage({
+      type: 'error',
+      error: error.message
+    });
   }
+  
+  isProcessing = false;
+}
+
+function applyHannWindow(data) {
+  const windowed = new Float32Array(data.length);
+  for (let i = 0; i < data.length; i++) {
+    windowed[i] = data[i] * (0.5 - 0.5 * Math.cos(2 * Math.PI * i / (data.length - 1)));
+  }
+  return windowed;
+}
+
+// Optimized FFT using Cooley-Tukey algorithm
+function fastFFT(data) {
+  const n = data.length;
+  
+  // For non-power-of-2, use DFT
+  if (!isPowerOfTwo(n)) {
+    return dft(data);
+  }
+  
+  // Base case
+  if (n <= 1) {
+    return new Float32Array([Math.abs(data[0] || 0)]);
+  }
+  
+  // Divide
+  const even = new Float32Array(n / 2);
+  const odd = new Float32Array(n / 2);
+  
+  for (let i = 0; i < n / 2; i++) {
+    even[i] = data[2 * i];
+    odd[i] = data[2 * i + 1];
+  }
+  
+  // Conquer
+  const evenFFT = fastFFT(even);
+  const oddFFT = fastFFT(odd);
+  
+  // Combine
+  const spectrum = new Float32Array(n / 2);
+  
+  for (let k = 0; k < n / 2; k++) {
+    const angle = -2 * Math.PI * k / n;
+    const real = Math.cos(angle) * oddFFT[k];
+    const imag = Math.sin(angle) * oddFFT[k];
+    
+    const magnitude = Math.sqrt(
+      Math.pow(evenFFT[k] + real, 2) + Math.pow(imag, 2)
+    );
+    
+    spectrum[k] = magnitude / n;
+  }
+  
+  return spectrum;
+}
+
+// Fallback DFT for non-power-of-2 sizes (optimized version)
+function dft(data) {
+  const n = data.length;
+  const spectrum = new Float32Array(Math.floor(n / 2));
+  
+  for (let k = 0; k < spectrum.length; k++) {
+    let real = 0;
+    let imag = 0;
+    
+    // Only compute up to Nyquist frequency
+    const step = Math.max(1, Math.floor(n / 2048)); // Downsample for speed
+    
+    for (let i = 0; i < n; i += step) {
+      const angle = -2 * Math.PI * k * i / n;
+      real += data[i] * Math.cos(angle);
+      imag += data[i] * Math.sin(angle);
+    }
+    
+    spectrum[k] = Math.sqrt(real * real + imag * imag) / n;
+  }
+  
+  return spectrum;
+}
+
+function isPowerOfTwo(n) {
+  return n > 0 && (n & (n - 1)) === 0;
+}
+
+function findSpectralPeaks(spectrum, sampleRate, fftSize, threshold = 30) {
+  const peaks = [];
+  // Convert threshold (10-100) to amplitude threshold (0.01-0.5)
+  // Lower threshold = more sensitive = lower amplitude required
+  const thresholdValue = 0.01 + ((100 - threshold) / 100) * 0.49;
+  
+  console.log('Finding peaks with threshold:', threshold, 'amplitude threshold:', thresholdValue);
+  
+  // Find local maxima with improved peak detection
+  for (let i = 3; i < spectrum.length - 3; i++) {
+    const current = spectrum[i];
+    
+    if (current > thresholdValue &&
+        current > spectrum[i - 1] &&
+        current > spectrum[i - 2] &&
+        current > spectrum[i - 3] &&
+        current > spectrum[i + 1] &&
+        current > spectrum[i + 2] &&
+        current > spectrum[i + 3]) {
+      
+      const frequency = i * sampleRate / fftSize;
+      
+      // Filter to musical range (27.5 Hz to 4200 Hz)
+      if (frequency >= 27.5 && frequency <= 4200) {
+        // Parabolic interpolation for better frequency accuracy
+        const alpha = spectrum[i - 1];
+        const beta = spectrum[i];
+        const gamma = spectrum[i + 1];
+        const offset = 0.5 * (alpha - gamma) / (alpha - 2 * beta + gamma);
+        const refinedFreq = (i + offset) * sampleRate / fftSize;
+        
+        peaks.push({
+          frequency: refinedFreq,
+          amplitude: current
+        });
+      }
+    }
+  }
+  
+  // Sort by amplitude and take top peaks
+  peaks.sort((a, b) => b.amplitude - a.amplitude);
+  // Adjust max peaks based on threshold - lower threshold = more peaks allowed
+  const maxPeaks = Math.floor(4 + (100 - threshold) / 10);
+  return peaks.slice(0, maxPeaks);
+}
+
+function frequencyToMIDI(frequency) {
+  return Math.round(69 + 12 * Math.log2(frequency / 440));
 }
