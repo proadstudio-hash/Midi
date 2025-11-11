@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Audio → MIDI (Mono / Poly / Rhythm / Hybrid + CQT)</title>
+  <title>Audio → MIDI (Mono / Poly / Poly New / Rhythm / Hybrid + CQT)</title>
   <style>
     :root{ --bg:#0f1115; --fg:#eaeef2; --muted:#99a1b3; --accent:#6aa1ff; --accent-2:#b277ff; --border:#2a2f3a; --ok:#40c057; --warn:#fab005; --err:#fa5252; }
     *{box-sizing:border-box}
@@ -34,7 +34,7 @@
 </head>
 <body>
   <div class="wrap">
-    <h1>Audio → MIDI (Mono / Poly / Rhythm / Hybrid + CQT)</h1>
+    <h1>Audio → MIDI (Mono / Poly / Poly New / Rhythm / Hybrid + CQT)</h1>
     <div class="row">
       <div class="card sidebar">
         <div id="uploadSection" class="upload">
@@ -43,12 +43,14 @@
         <div id="fileInfo" style="margin-top:12px;display:none">
           <div><b id="fileName"></b> <span class="pill" id="fileSize"></span></div>
           <div>Durata: <b id="fileDuration">-</b> • SR: <b id="sampleRate">-</b></div>
+          <div>Tempo stimato: <b id="estBPM">-</b> BPM</div>
         </div>
         <div class="controls" style="margin-top:12px">
           <div>
             <label>Algorithm</label>
             <select id="algorithmSelect">
               <option value="poly">Polyphonic</option>
+              <option value="poly_new">Poly New (HPSS + HPS)</option>
               <option value="mono">Monophonic</option>
               <option value="rhythm">Rhythmic</option>
               <option value="hybrid" selected>Hybrid</option>
