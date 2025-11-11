@@ -7,9 +7,9 @@
   <style>
     :root{ --bg:#0f1115; --fg:#eaeef2; --muted:#99a1b3; --accent:#6aa1ff; --accent-2:#b277ff; --border:#2a2f3a; --ok:#40c057; --warn:#fab005; --err:#fa5252; }
     *{box-sizing:border-box}
-    body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial}
+    body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial}
     h1{font-size:18px;margin:16px 0}
-    .wrap{max-width:1100px;margin:0 auto;padding:20px}
+    .wrap{max-width:1200px;margin:0 auto;padding:20px}
     .row{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
     .card{background:#12151c;border:1px solid var(--border);border-radius:12px;padding:16px;flex:1}
     .controls{display:flex;gap:16px;flex-wrap:wrap}
@@ -17,7 +17,7 @@
     input[type=range],input[type=number],select{width:220px}
     .upload{border:1px dashed var(--border);border-radius:12px;padding:16px;text-align:center;cursor:pointer;background:#0d1016}
     .upload.drag{outline:2px dashed var(--accent)}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    .grid2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
     canvas{width:100%;height:280px;background:#0a0d12;border:1px solid var(--border);border-radius:8px}
     table{width:100%;border-collapse:collapse}
     th,td{border-bottom:1px solid var(--border);padding:6px 8px;text-align:left}
@@ -59,7 +59,7 @@
           <div>
             <label>Analysis Mode</label>
             <select id="analysisMode">
-              <option value="full">Full</option>
+              <option value="full" selected>Full</option>
               <option value="fast">Fast</option>
               <option value="fallback">Fallback</option>
               <option value="cqt">CQT (Hi‑Res)</option>
@@ -93,11 +93,12 @@
         <div class="status"><span class="dot idle" id="statusDot"></span><span id="statusText">Pronto</span><span class="pill" id="progressPercent" style="margin-left:auto">0%</span></div>
         <div id="warningMessage" style="margin-top:6px;color:var(--warn);display:none"></div>
       </div>
-      <div class="card" style="flex:2">
-        <div class="grid">
+      <div class="card" style="flex:2.2">
+        <div class="grid2">
           <div><label>Waveform</label><canvas id="waveformCanvas" width="800" height="200"></canvas></div>
           <div><label>Piano Roll (20–20k Hz + tastiera)</label><canvas id="pianoRollCanvas" width="800" height="400"></canvas></div>
         </div>
+        <div style="margin-top:16px"><label>Spectral Analysis (log‑freq 20–20k Hz)</label><canvas id="spectrogramCanvas" width="1100" height="380"></canvas></div>
         <div style="margin-top:12px">
           <table><thead><tr><th>#</th><th>Time (s)</th><th>Note</th><th>Oct</th><th>Freq (Hz)</th><th>Dur (s)</th><th>Vel</th></tr></thead><tbody id="notesTableBody"></tbody></table>
         </div>
