@@ -1,4 +1,4 @@
-// Web Worker — Multi‑Algorithm: monophonic (YIN/MPM), polyphonic (harmonic sum + masking), rhythmic (spectral flux), hybrid
+// Web Worker — Multi‑Algorithm (mono/poly/rhythm/hybrid)
 let isProcessing=false, isCancelled=false;
 
 self.onmessage = (e)=>{
@@ -238,7 +238,7 @@ function analyzeChunkMulti(payload){
           for (let d=-1; d<=1; d++){ const j=idxBase+d; if (j>=0 && j<masked.length) masked[j] *= 0.1; }
         }
         let picks=0;
-        while (picks < maxPolyphony){
+        while (picks < 16){
           let best=-1, bestVal=relThresh;
           for (let i=0;i<masked.length;i++){
             const v=masked[i];
@@ -266,7 +266,7 @@ function analyzeChunkMulti(payload){
         if (maxW>0){ let bi=-1, bv=0; for (let i=0;i<salW.length;i++) if (salW[i]>bv){ bv=salW[i]; bi=i; } if (bi>=0) merged.add(MIDI_MIN+bi); }
         for (const m of merged) notesOut.push({ time, pitch:m, velocity:100, duration:frameDur });
       } else if (algorithm === 'rhythm'){
-        // compute later
+        // handle after loop
       } else {
         for (const m of cand_poly){ notesOut.push({ time, pitch:m, velocity:100, duration:frameDur }); }
       }
