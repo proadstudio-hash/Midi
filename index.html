@@ -1,0 +1,126 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Audio → MIDI (Hi‑Res CQT)</title>
+  <style>
+    :root{
+      --bg:#0f1115; --fg:#eaeef2; --muted:#99a1b3; --accent:#6aa1ff;
+      --accent-2:#b277ff; --border:#2a2f3a; --ok:#40c057; --warn:#fab005; --err:#fa5252;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Arial}
+    h1{font-size:18px;margin:16px 0}
+    .wrap{max-width:1100px;margin:0 auto;padding:20px}
+    .row{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+    .card{background:#12151c;border:1px solid var(--border);border-radius:12px;padding:16px;flex:1}
+    .controls{display:flex;gap:16px;flex-wrap:wrap}
+    label{display:block;margin-bottom:8px;color:var(--muted)}
+    input[type=range],input[type=number],select{width:200px}
+    .upload{border:1px dashed var(--border);border-radius:12px;padding:16px;text-align:center;cursor:pointer;background:#0d1016}
+    .upload.drag{outline:2px dashed var(--accent)}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    canvas{width:100%;height:280px;background:#0a0d12;border:1px solid var(--border);border-radius:8px}
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px solid var(--border);padding:6px 8px;text-align:left}
+    .progress{height:8px;background:#0b0e14;border-radius:6px;border:1px solid var(--border);overflow:hidden}
+    .bar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent-2))}
+    .status{display:flex;align-items:center;gap:8px;color:var(--muted);margin-top:8px}
+    .dot{width:10px;height:10px;border-radius:50%;background:#555}
+    .dot.idle{background:#555}.dot.processing{background:var(--warn)}.dot.completed{background:var(--ok)}.dot.error{background:var(--err)}
+    .btn{background:#171b24;border:1px solid var(--border);color:var(--fg);padding:8px 12px;border-radius:8px;cursor:pointer}
+    .btn:disabled{opacity:.5;cursor:default}
+    .pill{padding:2px 8px;border:1px solid var(--border);border-radius:999px;color:var(--muted)}
+    .sidebar{min-width:280px;max-width:320px}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Audio → MIDI (FFT + Hi‑Res CQT) </h1>
+    <div class="row">
+      <div class="card sidebar">
+        <div id="uploadSection" class="upload">
+          <div>Trascina qui un file WAV/MP3 o <br><br><input type="file" id="fileInput" accept=".wav,.mp3,audio/*"></div>
+        </div>
+        <div id="fileInfo" style="margin-top:12px;display:none">
+          <div><b id="fileName"></b> <span class="pill" id="fileSize"></span></div>
+          <div>Durata: <b id="fileDuration">-</b> • SR: <b id="sampleRate">-</b></div>
+        </div>
+        <div class="controls" style="margin-top:12px">
+          <div>
+            <label>Soglia rilevamento: <b id="thresholdValue">120</b></label>
+            <input type="range" id="threshold" min="10" max="1000" step="1" value="120">
+          </div>
+          <div>
+            <label>HPF (Hz): <b id="hpfValue">20</b></label>
+            <input type="number" id="hpfInput" min="10" max="10000" step="1" value="20">
+          </div>
+          <div>
+            <label>LPF (Hz): <b id="lpfValue">20000</b></label>
+            <input type="number" id="lpfInput" min="100" max="22050" step="1" value="20000">
+          </div>
+          <div>
+            <label>Analysis Mode</label>
+            <select id="analysisMode">
+              <option value="full">Full</option>
+              <option value="fast">Fast</option>
+              <option value="fallback">Fallback</option>
+              <option value="cqt">CQT (Hi‑Res)</option>
+            </select>
+          </div>
+          <div>
+            <label>Playback speed: <b id="playbackSpeedValue">100%</b></label>
+            <input type="range" id="playbackSpeed" min="50" max="150" step="1" value="100">
+          </div>
+        </div>
+        <div class="controls" style="margin-top:8px">
+          <button class="btn" id="reanalyzeBtn">🔎 Re‑Analyze</button>
+          <button class="btn" id="exportBtn">💾 Export MIDI</button>
+          <button class="btn" id="cancelBtn" style="display:none">✖️ Cancel</button>
+        </div>
+        <div class="controls" style="margin-top:8px">
+          <button class="btn" id="playBtn" disabled>▶︎ Play</button>
+          <button class="btn" id="pauseBtn" disabled>⏸</button>
+          <button class="btn" id="stopBtn" disabled>⏹</button>
+          <button class="btn" id="playMidiBtn" disabled>🎹 Play MIDI</button>
+          <button class="btn" id="stopMidiBtn" disabled>⏹ MIDI</button>
+        </div>
+        <div class="progress" id="progressContainer" style="margin-top:12px;display:none">
+          <div class="bar" id="progressFill"></div>
+        </div>
+        <div class="status">
+          <span class="dot idle" id="statusDot"></span>
+          <span id="statusText">Pronto</span>
+          <span class="pill" id="progressPercent" style="margin-left:auto">0%</span>
+        </div>
+        <div id="warningMessage" style="margin-top:6px;color:var(--warn);display:none"></div>
+      </div>
+      <div class="card" style="flex:2">
+        <div class="grid">
+          <div>
+            <label>Waveform</label>
+            <canvas id="waveformCanvas" width="800" height="200"></canvas>
+          </div>
+          <div>
+            <label>Piano Roll (20–20k Hz + tastiera)</label>
+            <canvas id="pianoRollCanvas" width="800" height="400"></canvas>
+          </div>
+        </div>
+        <div style="margin-top:12px">
+          <table>
+            <thead>
+              <tr>
+                <th>#</th><th>Time (s)</th><th>Note</th><th>Oct</th><th>Freq (Hz)</th><th>Dur (s)</th><th>Vel</th>
+              </tr>
+            </thead>
+            <tbody id="notesTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
