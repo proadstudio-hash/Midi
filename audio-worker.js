@@ -1,4 +1,4 @@
-// Web Worker — Multi‑Algorithm (mono/poly/rhythm/hybrid)
+// Web Worker — add harmonic rejection & pass through to main thread
 let isProcessing=false, isCancelled=false;
 
 self.onmessage = (e)=>{
@@ -117,58 +117,72 @@ function yinMono(frame, sr, fmin=40, fmax=5000){
   return null;
 }
 
-function spectralFluxOnsets(framesMag, hopSec){
-  const onsets=[];
-  let prev=null;
-  const N = framesMag.length;
-  const flux = new Float32Array(N);
-  for (let i=0;i<N;i++){
-    const cur=framesMag[i];
-    if (!prev){ flux[i]=0; prev=cur; continue; }
-    let s=0;
-    for (let k=0;k<cur.length;k++){
-      const d = cur[k]-prev[k];
-      if (d>0) s += d;
+function medianFilterFreq(vec, win=7){
+  const out=new Float32Array(vec.length); const half=(win|0)>>1;
+  for (let k=0;k<vec.length;k++){
+    const a=[]; for (let j=Math.max(0,k-half); j<=Math.min(vec.length-1,k+half); j++) a.push(vec[j]);
+    a.sort((x,y)=>x-y); out[k]=a[Math.floor(a.length/2)]||0;
+  }
+  return out;
+}
+function localTimeMedian(frames, bin, fi){
+  let acc=[];
+  for (let t=Math.max(0,fi-2); t<=Math.min(frames.length-1, fi+2); t++) acc.push(frames[t][bin]);
+  acc.sort((a,b)=>a-b);
+  return acc[Math.floor(acc.length/2)]||0;
+}
+function hpsOnSpectrum(spec, maxFactor=4){
+  const n=spec.length; const out=new Float32Array(n);
+  for (let i=1;i<n;i++){
+    let prod=spec[i];
+    for (let f=2; f<=maxFactor; f++){
+      const idx=Math.floor(i/f); if (idx>0) prod *= spec[idx];
     }
-    flux[i]=s; prev=cur;
+    out[i]=prod;
   }
-  const win=16;
-  const thr=new Float32Array(N);
-  for (let i=0;i<N;i++){
-    let a=[];
-    for (let j=Math.max(0,i-win); j<Math.min(N,i+win); j++) a.push(flux[j]);
-    a.sort((x,y)=>x-y);
-    thr[i]=a.length? a[Math.floor(a.length*0.6)]*1.2 : 0;
-  }
-  for (let i=1;i<N-1;i++){
-    if (flux[i]>thr[i] && flux[i]>=flux[i-1] && flux[i]>=flux[i+1]){
-      const t=i*hopSec;
-      const vel = Math.max(10, Math.min(127, Math.round(20 + 100*(flux[i]/(thr[i]+1e-9)))));
-      onsets.push({ time:t, pitch:36, velocity:vel, duration:0.1 });
+  return out;
+}
+function specBinToMidi(bin, sr, nBins){ const freq = bin*sr/(2*nBins); return Math.round(69+12*Math.log2(freq/440)); }
+
+function pruneHarmonics(list, strength){
+  if (!list || !list.length || strength<=0) return list;
+  const centsTol = 20 + (1-strength)*80;
+  const out=[];
+  list.sort((a,b)=> (a.pitch||a) - (b.pitch||b));
+  for (let i=0;i<list.length;i++){
+    const hi = list[i]; const mH = hi.pitch||hi;
+    let harmonic=false;
+    for (let j=0;j<i;j++){
+      const lo = list[j]; const mL = lo.pitch||lo;
+      const dSemis = mH - mL;
+      if (dSemis <= 0) continue;
+      const r = Math.pow(2, dSemis/12);
+      const n = Math.min(6, Math.max(2, Math.round(r)));
+      const targetSemis = 12*Math.log2(n);
+      const dCents = Math.abs(dSemis - targetSemis)*100;
+      if (dCents <= centsTol){ harmonic=true; break; }
     }
+    if (!harmonic) out.push(hi);
   }
-  return onsets;
+  return out;
 }
 
 function analyzeChunkMulti(payload){
-  const { audioData, sampleRate, chunkIndex, totalChunks, fftSize, threshold, timeOffset, mode, algorithm } = payload;
+  const { audioData, sampleRate, chunkIndex, totalChunks, fftSize, threshold, timeOffset, mode, algorithm, harmonicRejection=0.7 } = payload;
   if (isCancelled){ self.postMessage({type:'cancelled'}); return; }
   isProcessing = true;
   try{
     const audioArray = audioData instanceof Float32Array ? audioData : new Float32Array(audioData);
-
     const isCQT = (mode === 'cqt');
     const frameSize = Math.max(1024, isCQT ? Math.max(fftSize, 16384) : (fftSize|0));
     const hopSize   = isCQT ? Math.max(128, Math.floor(frameSize/8)) : Math.floor(frameSize/2);
     const maxHarm   = isCQT ? 8 : 6;
-
     const { tables, window } = buildHarmonicTables(sampleRate, maxHarm, frameSize);
+    const nBins = frameSize/2;
 
-    const maxPolyphony = 16;
-
-    const notesOut = [];
-    const salienceRows = [];
     const framesMag = [];
+    const framesTime = [];
+    const salRows = [];
 
     const numFrames = Math.max(0, Math.floor((audioArray.length - frameSize)/hopSize));
 
@@ -176,106 +190,134 @@ function analyzeChunkMulti(payload){
     const im = new Float32Array(frameSize);
 
     for (let f=0; f<numFrames; f++){
-      if (isCancelled){ self.postMessage({type:'cancelled'}); return; }
       const start = f*hopSize;
       const frame = applyWindow(audioArray.subarray(start, start+frameSize), window);
-      const frameRMS = rms(frame);
-      const time = timeOffset + start / sampleRate;
-      const frameDur = hopSize / sampleRate;
-
+      framesTime.push(frame);
       re.set(frame); im.fill(0); fftRadix2(re, im);
-      const mags = new Float32Array(frameSize/2);
-      for (let k=0;k<mags.length;k++){ const rr=re[k], ii=im[k]; mags[k]=Math.hypot(rr,ii); }
+      const mags = new Float32Array(nBins);
+      for (let k=0;k<nBins;k++){ const rr=re[k], ii=im[k]; mags[k]=Math.hypot(rr,ii); }
       framesMag.push(mags);
 
-      if (frameRMS < 1e-4){
-        salienceRows.push(new Uint8Array(MIDI_MAX-MIDI_MIN+1));
+      const sal = new Float32Array(MIDI_MAX-MIDI_MIN+1);
+      let maxSal=0;
+      for (let idx=0; idx<tables.length; idx++){
+        const hs=tables[idx].harmonics; let s=0;
+        for (let h=0; h<hs.length; h++){ const {k,coeff}=hs[h]; s += (1/k) * goertzelPower(frame, coeff); }
+        sal[idx]=s; if (s>maxSal) maxSal=s;
+      }
+      const row = new Uint8Array(sal.length);
+      if (maxSal>0){ for (let i=0;i<sal.length;i++){ row[i]=Math.max(0,Math.min(255, Math.round(255*sal[i]/maxSal))); } }
+      salRows.push(row);
+    }
+
+    const hopSec = hopSize / sampleRate;
+    const notesOut = [];
+
+    for (let f=0; f<numFrames; f++){
+      const time = timeOffset + f*hopSec;
+      const frame = framesTime[f];
+      const mags  = framesMag[f];
+      const salRow = salRows[f];
+      const frameDur = hopSec;
+
+      if (algorithm==='rhythm') continue;
+
+      if (algorithm==='mono'){
+        const f0 = yinMono(frame, sampleRate, 40, 5000);
+        if (f0){ const m = Math.round(freqToMidi(f0)); if (m>=MIDI_MIN && m<=MIDI_MAX){
+          const vel = Math.max(10, Math.min(127, Math.round(20 + 0.42*(salRow[m-MIDI_MIN]||0))));
+          notesOut.push({ time, pitch:m, velocity:vel, duration:frameDur });
+        }}
         continue;
       }
 
-      const sal = new Float32Array(MIDI_MAX-MIDI_MIN+1);
-      let maxSal = 0;
-      for (let idx=0; idx<tables.length; idx++){
-        const hs = tables[idx].harmonics;
-        let s = 0;
-        for (let h=0; h<hs.length; h++){
-          const {k, coeff} = hs[h];
-          s += (1/k) * goertzelPower(frame, coeff);
-        }
-        sal[idx] = s; if (s > maxSal) maxSal = s;
-      }
-      const salW = new Float32Array(sal.length);
-      if (maxSal>0){
-        for (let i=0;i<sal.length;i++){
-          let v0=sal[i], v1=sal[i-1]||sal[i], v2=sal[i+1]||sal[i];
-          let v3=sal[i-2]||sal[i], v4=sal[i+2]||sal[i];
-          const vals = [v0,v1,v2,v3,v4].sort((a,b)=>a-b);
-          const med = vals[2];
-          salW[i] = Math.max(0, sal[i] - 0.8*med);
-        }
-      }
-      let maxW = 0; for (let i=0;i<salW.length;i++) if (salW[i]>maxW) maxW = salW[i];
-      const row = new Uint8Array(salW.length);
-      if (maxW>0){ for (let i=0;i<salW.length;i++){ row[i] = Math.max(0, Math.min(255, Math.round(255 * salW[i]/maxW))); } }
-      salienceRows.push(row);
+      let frameList=[];
 
-      const cand_poly = [];
-      if (maxW>0){
-        const relThresh = 0.5 * maxW;
-        const masked = salW.slice();
-        function isLocalPeak(arr,i){
-          const L=i>0?arr[i-1]:-Infinity, R=i<arr.length-1?arr[i+1]:-Infinity;
-          return arr[i]>=L && arr[i]>=R;
-        }
-        function maskSeries(idxBase){
-          const m0 = MIDI_MIN + idxBase;
+      if (algorithm==='poly'){
+        const arr = Array.from(salRow);
+        const masked = arr.map(v=>v);
+        function isPeak(i){ const L=i>0?masked[i-1]:-1, R=i<masked.length-1?masked[i+1]:-1; return masked[i]>=L && masked[i]>=R; }
+        let count=0, thr= Math.max(30, 0.5*Math.max(...masked));
+        while (count<16){
+          let bi=-1,bv=thr;
+          for (let i=0;i<masked.length;i++){ const v=masked[i]; if (v>bv && isPeak(i)){ bi=i; bv=v; } }
+          if (bi<0) break;
+          const m = MIDI_MIN + bi;
+          const vel = Math.max(10, Math.min(127, Math.round(20 + 0.42*bv)));
+          frameList.push({ pitch:m, velocity:vel });
           for (let h=1; h<=8; h++){
-            const fH = midiToFreq(m0)*h;
-            const mH = 69 + 12*Math.log2(fH/A4);
-            const iH = Math.round(mH) - MIDI_MIN;
-            for (let d=-1; d<=1; d++){ const j=iH+d; if (j>=0 && j<masked.length) masked[j] *= 0.1; }
+            const mh = Math.round(m + 12*Math.log2(h));
+            const j = mh - MIDI_MIN;
+            for (let d=-1; d<=1; d++){ const idx=j+d; if (idx>=0 && idx<masked.length) masked[idx]*=0.1; }
           }
-          for (let d=-1; d<=1; d++){ const j=idxBase+d; if (j>=0 && j<masked.length) masked[j] *= 0.1; }
+          count++;
         }
-        let picks=0;
-        while (picks < 16){
-          let best=-1, bestVal=relThresh;
-          for (let i=0;i<masked.length;i++){
-            const v=masked[i];
-            if (v>bestVal && isLocalPeak(masked,i)){ best=i; bestVal=v; }
+      } else { // poly_new or hybrid
+        const harm = medianFilterFreq(mags, 9);
+        const perc_med = new Float32Array(mags.length);
+        for (let k=0;k<mags.length;k++) perc_med[k] = localTimeMedian(framesMag, k, f);
+        const harmMask = new Float32Array(mags.length);
+        for (let k=0;k<mags.length;k++) harmMask[k] = harm[k] / (harm[k] + perc_med[k] + 1e-9);
+        const harmSpec = new Float32Array(mags.length);
+        for (let k=0;k<mags.length;k++) harmSpec[k] = mags[k]*harmMask[k];
+
+        const hps = hpsOnSpectrum(harmSpec, 4);
+        let maxHps=0; for (let i=1;i<hps.length;i++) if (hps[i]>maxHps) maxHps=hps[i];
+        const hpsThr = maxHps*0.35;
+        const candidates=[];
+        for (let i=2;i<hps.length-2;i++){
+          if (hps[i]>hpsThr && hps[i]>=hps[i-1] && hps[i]>=hps[i+1]){
+            const m = specBinToMidi(i, sampleRate, nBins);
+            if (m>=MIDI_MIN && m<=MIDI_MAX) candidates.push(m);
           }
-          if (best<0) break;
-          cand_poly.push(MIDI_MIN + best);
-          maskSeries(best);
-          picks++;
         }
+        const arr = Array.from(salRow);
+        const topS=[]; const tmp=arr.slice();
+        for (let k=0;k<10;k++){
+          let bi=-1,bv=0;
+          for (let i=0;i<tmp.length;i++){ if (tmp[i]>bv){ bv=tmp[i]; bi=i; } }
+          if (bi<0) break;
+          topS.push(MIDI_MIN+bi);
+          tmp[bi]=0;
+        }
+        const merged = new Set([...candidates, ...topS]);
+        const finalCand = new Set();
+        merged.forEach(m=>{ if (merged.has(m-12)) finalCand.add(m-12); else finalCand.add(m); });
+        const outList=[];
+        finalCand.forEach(m=>{
+          const idx=m-MIDI_MIN;
+          const s = arr[idx]||0; if (s<20) return;
+          const freq = A4*Math.pow(2,(m-69)/12);
+          const bin = Math.round(freq * (2*nBins) / sampleRate);
+          const hpsVal = (hps[bin]|0);
+          const hpsNorm = maxHps>0 ? (hpsVal/maxHps) : 0;
+          const sNorm = Math.min(1, s/255);
+          const fused = 0.6*sNorm + 0.4*hpsNorm;
+          const vel = Math.max(10, Math.min(127, Math.round(15 + fused*112)));
+          outList.push({pitch:m, velocity:vel});
+        });
+        outList.sort((a,b)=>b.velocity-a.velocity);
+        frameList = outList.slice(0,16);
       }
 
-      const f0 = yinMono(frame, sampleRate, 40, 5000);
-      const cand_mono = [];
-      if (f0){ const m = Math.round(freqToMidi(f0)); if (m>=MIDI_MIN && m<=MIDI_MAX) cand_mono.push(m); }
+      // Harmonic rejection
+      frameList = pruneHarmonics(frameList, harmonicRejection);
 
-      if (algorithm === 'mono'){
-        if (cand_mono.length){ notesOut.push({ time, pitch:cand_mono[0], velocity:100, duration:frameDur }); }
-      } else if (algorithm === 'poly'){
-        for (const m of cand_poly){ notesOut.push({ time, pitch:m, velocity:100, duration:frameDur }); }
-      } else if (algorithm === 'hybrid'){
-        const merged = new Set();
-        for (const m of cand_poly) merged.add(m);
-        if (cand_mono.length) merged.add(cand_mono[0]);
-        if (maxW>0){ let bi=-1, bv=0; for (let i=0;i<salW.length;i++) if (salW[i]>bv){ bv=salW[i]; bi=i; } if (bi>=0) merged.add(MIDI_MIN+bi); }
-        for (const m of merged) notesOut.push({ time, pitch:m, velocity:100, duration:frameDur });
-      } else if (algorithm === 'rhythm'){
-        // handle after loop
-      } else {
-        for (const m of cand_poly){ notesOut.push({ time, pitch:m, velocity:100, duration:frameDur }); }
+      for (const c of frameList){
+        notesOut.push({ time, pitch:c.pitch, velocity:c.velocity, duration:frameDur });
       }
     }
 
-    if (algorithm === 'rhythm'){
-      const hopSec = hopSize / sampleRate;
-      const onsetNotes = spectralFluxOnsets(framesMag, hopSec);
-      for (const n of onsetNotes) notesOut.push(n);
+    if (algorithm==='rhythm'){
+      const N=framesMag.length; if (N>0){
+        let prev=null; const flux=new Float32Array(N);
+        for (let i=0;i<N;i++){ const cur=framesMag[i]; if (!prev){ flux[i]=0; prev=cur; continue; } let s=0; for (let k=0;k<cur.length;k++){ const d=cur[k]-prev[k]; if (d>0) s+=d; } flux[i]=s; prev=cur; }
+        const win=16; const thr=new Float32Array(N);
+        for (let i=0;i<N;i++){ const a=[]; for (let j=Math.max(0,i-win); j<Math.min(N,i+win); j++) a.push(flux[j]); a.sort((x,y)=>x-y); thr[i]=a.length? a[Math.floor(a.length*0.6)]*1.2:0; }
+        for (let i=1;i<N-1;i++){ if (flux[i]>thr[i] && flux[i]>=flux[i-1] && flux[i]>=flux[i+1]){
+          const t=timeOffset + i*(hopSec); const vel=Math.max(10, Math.min(127, Math.round(20 + 100*(flux[i]/(thr[i]+1e-9))))); notesOut.push({ time:t, pitch:36, velocity:vel, duration:0.1 });
+        }}
+      }
     }
 
     self.postMessage({ 
@@ -283,8 +325,8 @@ function analyzeChunkMulti(payload){
       chunkIndex, 
       totalChunks, 
       notes: notesOut, 
-      salRows: salienceRows, 
-      hopSec: hopSize / sampleRate
+      salRows: salRows, 
+      hopSec: hopSec
     });
 
   }catch(err){

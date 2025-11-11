@@ -1,4 +1,4 @@
-// Audio → MIDI — Multi‑Algorithm with robust no‑Worker fallback + Velocity fix + Tempo estimate + Poly New option
+// Audio → MIDI — Velocity fix + MIDI Stop + Harmonic Rejection slider
 let audioContext=null, audioBuffer=null, filteredBuffer=null;
 let audioSource=null, isPlaying=false, currentTime=0;
 
@@ -12,6 +12,7 @@ let SAL_ROWS=[];
 let SAL_HOP_SEC=null;
 
 let ESTIMATED_BPM=120;
+let midiOscs=[]; // for stopping MIDI playback
 
 const ANALYSIS_MODES={ full:{fftSize:8192}, fast:{fftSize:4096}, fallback:{fftSize:2048}, cqt:{fftSize:16384} };
 const CHUNK_SIZE=4096*32;
@@ -61,6 +62,9 @@ document.addEventListener('DOMContentLoaded', () => {
     const lblMap={hpfInput:'hpfValue', lpfInput:'lpfValue', minVelInput:'minVelValue', minDurInput:'minDurValue'};
     if (el) el.addEventListener('input', e=>{ const v=e.target.value; const lbl=document.getElementById(lblMap[id]); if (lbl) lbl.textContent=v; if (id==='minVelInput' || id==='minDurInput') reRenderFiltered(); });
   });
+
+  const harm=document.getElementById('harmFilter');
+  if (harm) harm.addEventListener('input', e=>{ const lbl=document.getElementById('harmFilterValue'); if (lbl) lbl.textContent=e.target.value+'%'; });
 
   const reanalyze=document.getElementById('reanalyzeBtn');
   if (reanalyze) reanalyze.addEventListener('click', async ()=>{
@@ -163,6 +167,7 @@ function handleFile(file){
 
 function resetSalience(){ SAL_ROWS=[]; SAL_HOP_SEC=null; }
 function getAlgo(){ return (document.getElementById('algorithmSelect')||{}).value || 'hybrid'; }
+function getHarmReject(){ const v=parseInt((document.getElementById('harmFilter')||{}).value||'70'); return Math.max(0,Math.min(100,v))/100; }
 
 // ===== Analysis orchestrator =====
 async function analyzeAudio(buffer, threshold=120){
@@ -177,8 +182,9 @@ async function analyzeAudio(buffer, threshold=120){
     const mode=(document.getElementById('analysisMode')||{}).value||'full';
     const fftSize=(ANALYSIS_MODES[mode]||ANALYSIS_MODES.full).fftSize;
     const algo = getAlgo();
+    const harmRej = getHarmReject();
 
-    await processAudioInChunks(buffer, fftSize, threshold, mode, algo);
+    await processAudioInChunks(buffer, fftSize, threshold, mode, algo, harmRej);
     if (isCancelled){ handleCancellation(); return; }
 
     updateProgress(90,'Ricostruzione note...');
@@ -186,6 +192,10 @@ async function analyzeAudio(buffer, threshold=120){
     if (!built.length && SAL_ROWS.length && SAL_HOP_SEC){
       built = buildNotesFromSalience(SAL_ROWS, SAL_HOP_SEC);
     }
+
+    // Velocity refinement from salience energy area (solves "always 100")
+    built = refineVelocitiesFromSalience(built);
+
     detectedNotes = built;
     const DETECTED_RAW = detectedNotes.slice();
     detectedNotes = applyPostFilters(DETECTED_RAW);
@@ -203,6 +213,7 @@ async function analyzeAudio(buffer, threshold=120){
     showStatus(`Note trovate: ${detectedNotes.length}`,'success');
     const pb=document.getElementById('playBtn'); if (pb) pb.disabled=false;
     const pm=document.getElementById('playMidiBtn'); if (pm) pm.disabled=false;
+    const sm=document.getElementById('stopMidiBtn'); if (sm) sm.disabled=false;
   }catch(err){
     console.error(err);
     showStatus('Errore analisi: '+err.message,'error');
@@ -214,7 +225,7 @@ async function analyzeAudio(buffer, threshold=120){
   }
 }
 
-async function processAudioInChunks(buffer, fftSize, threshold, mode, algorithm){
+async function processAudioInChunks(buffer, fftSize, threshold, mode, algorithm, harmRej){
   const data=buffer.getChannelData(0), sr=buffer.sampleRate;
   totalChunks=Math.ceil(data.length/CHUNK_SIZE); processedChunks=0;
   for (let i=0;i<totalChunks;i++){
@@ -222,16 +233,16 @@ async function processAudioInChunks(buffer, fftSize, threshold, mode, algorithm)
     const s=i*CHUNK_SIZE, e=Math.min(s+CHUNK_SIZE, data.length);
     const chunk=data.slice(s,e);
     if (USE_WORKER && audioWorker){
-      await processChunkWithWorker(chunk, sr, i, totalChunks, fftSize, threshold, s/sr, mode, algorithm);
+      await processChunkWithWorker(chunk, sr, i, totalChunks, fftSize, threshold, s/sr, mode, algorithm, harmRej);
     } else {
-      await processChunkInline(chunk, sr, i, totalChunks, fftSize, threshold, s/sr, mode, algorithm);
+      await processChunkInline(chunk, sr, i, totalChunks, fftSize, threshold, s/sr, mode, algorithm, harmRej);
     }
     const elapsed=(Date.now()-analysisStartTime)/1000;
     if (elapsed>MAX_PROCESSING_TIME_SECONDS) throw new Error('Timeout analisi.');
   }
 }
 
-function processChunkWithWorker(audioData, sampleRate, chunkIndex, totalChunks, fftSize, threshold, timeOffset, mode, algorithm){
+function processChunkWithWorker(audioData, sampleRate, chunkIndex, totalChunks, fftSize, threshold, timeOffset, mode, algorithm, harmRej){
   return new Promise((resolve,reject)=>{
     if (!audioWorker){ USE_WORKER=false; resolve(); return; }
     const to=setTimeout(()=>{ cleanup(); USE_WORKER=false; resolve(); }, 30000);
@@ -243,7 +254,7 @@ function processChunkWithWorker(audioData, sampleRate, chunkIndex, totalChunks, 
     };
     function cleanup(){ clearTimeout(to); audioWorker && audioWorker.removeEventListener('message', handler); }
     audioWorker.addEventListener('message', handler);
-    audioWorker.postMessage({ type:'analyze', data:{ audioData:Array.from(audioData), sampleRate, chunkIndex, totalChunks, fftSize, threshold, timeOffset, mode, algorithm } });
+    audioWorker.postMessage({ type:'analyze', data:{ audioData:Array.from(audioData), sampleRate, chunkIndex, totalChunks, fftSize, threshold, timeOffset, mode, algorithm, harmonicRejection:harmRej } });
   });
 }
 
@@ -386,6 +397,43 @@ function reRenderFiltered(){
   updateNotesTable(filtered);
 }
 
+// ===== Velocity refinement from salience area =====
+function refineVelocitiesFromSalience(notes){
+  if (!notes?.length || !SAL_ROWS.length || !SAL_HOP_SEC) return notes;
+  const T = SAL_ROWS.length;
+  const P_MIN = 21;
+  const vals = [];
+  const out = notes.map(n => ({...n}));
+  for (const n of out){
+    const pIdx = n.pitch - P_MIN;
+    if (pIdx < 0 || pIdx >= SAL_ROWS[0].length) continue;
+    const on = Math.max(0, Math.floor(n.time / SAL_HOP_SEC));
+    const off = Math.min(T-1, Math.ceil((n.time + n.duration) / SAL_HOP_SEC));
+    let acc = 0, cnt = 0;
+    for (let t=on; t<=off; t++){
+      const row = SAL_ROWS[t];
+      // include +/- 1 semitone neighborhood
+      for (let d=-1; d<=1; d++){
+        const j = pIdx + d;
+        if (j>=0 && j<row.length){ acc += row[j]; cnt++; }
+      }
+    }
+    const mean = cnt ? acc / cnt : 0;
+    vals.push(mean);
+    n._salMean = mean;
+  }
+  if (!vals.length) return notes;
+  vals.sort((a,b)=>a-b);
+  const vmin = vals[0], vmax = vals[vals.length-1] || 1;
+  for (const n of out){
+    const norm = (n._salMean - vmin) / (vmax - vmin + 1e-9);
+    const vel = Math.max(1, Math.min(127, Math.round(12 + Math.pow(norm,0.7)*115)));
+    n.velocity = vel;
+    delete n._salMean;
+  }
+  return out;
+}
+
 // ===== Duration builders =====
 function buildFromWorkerEvents(events, hopSec){
   if (!events || !events.length) return [];
@@ -470,11 +518,10 @@ function estimateBPMFromNotes(notes){
     if (d>0.15 && d<2.5) intervals.push(d);
   }
   if (!intervals.length) return 120;
-  // histogram
   const bins = new Map();
   intervals.forEach(d=>{
     const bpm = 60/d;
-    const adj = bpm>200? bpm/2 : (bpm<60? bpm*2 : bpm); // fold to 60–200
+    const adj = bpm>200? bpm/2 : (bpm<60? bpm*2 : bpm);
     const k = Math.round(adj);
     bins.set(k, (bins.get(k)||0)+1);
   });
@@ -484,7 +531,6 @@ function estimateBPMFromNotes(notes){
 }
 
 // ===== Inline analyzer (fallback if Worker unavailable) =====
-// (kept identical logic to worker's 'poly'/'mono'/'rhythm' and computes velocities from salience)
 function hannWindow(len){ const w=new Float32Array(len); const d=len-1; for(let i=0;i<len;i++) w[i]=0.5-0.5*Math.cos(2*Math.PI*i/d); return w; }
 function applyWindow(x,w){ const y=new Float32Array(x.length); for(let i=0;i<x.length;i++) y[i]=x[i]*w[i]; return y; }
 function rms(x){ let s=0; for (let i=0;i<x.length;i++) s+=x[i]*x[i]; return Math.sqrt(s/x.length); }
@@ -524,14 +570,65 @@ function buildHarmonicTables(sampleRate, maxHarm, frameSize){
   return { tables, window };
 }
 
-async function processChunkInline(audioData, sampleRate, chunkIndex, total, fftSize, threshold, timeOffset, mode, algorithm){
+function medianFilterFreq(vec, win=7){
+  const out=new Float32Array(vec.length); const half=(win|0)>>1;
+  for (let k=0;k<vec.length;k++){
+    const a=[]; for (let j=Math.max(0,k-half); j<=Math.min(vec.length-1,k+half); j++) a.push(vec[j]);
+    a.sort((x,y)=>x-y); out[k]=a[Math.floor(a.length/2)]||0;
+  }
+  return out;
+}
+function localTimeMedian(frames, bin, fi){
+  let acc=[];
+  for (let t=Math.max(0,fi-2); t<=Math.min(frames.length-1, fi+2); t++) acc.push(frames[t][bin]);
+  acc.sort((a,b)=>a-b);
+  return acc[Math.floor(acc.length/2)]||0;
+}
+function hpsOnSpectrum(spec, maxFactor=4){
+  const n=spec.length; const out=new Float32Array(n);
+  for (let i=1;i<n;i++){
+    let prod=spec[i];
+    for (let f=2; f<=maxFactor; f++){
+      const idx=Math.floor(i/f); if (idx>0) prod *= spec[idx];
+    }
+    out[i]=prod;
+  }
+  return out;
+}
+function specBinToMidi(bin, sr, nBins){ const freq = bin*sr/(2*nBins); return Math.round(69+12*Math.log2(freq/440)); }
+
+function pruneHarmonics(list, strength){
+  if (!list || !list.length || strength<=0) return list;
+  const centsTol = 20 + (1-strength)*80; // 20c at 100% rejection → 100c at 0%
+  const out=[];
+  list.sort((a,b)=> (a.pitch||a) - (b.pitch||b));
+  for (let i=0;i<list.length;i++){
+    const hi = list[i]; const mH = hi.pitch||hi;
+    let harmonic=false;
+    for (let j=0;j<i;j++){
+      const lo = list[j]; const mL = lo.pitch||lo;
+      const dSemis = mH - mL;
+      if (dSemis <= 0) continue;
+      const r = Math.pow(2, dSemis/12);
+      // nearest integer ratio up to 6th harmonic
+      const n = Math.min(6, Math.max(2, Math.round(r)));
+      const targetSemis = 12*Math.log2(n);
+      const dCents = Math.abs(dSemis - targetSemis)*100;
+      if (dCents <= centsTol){ harmonic=true; break; }
+    }
+    if (!harmonic) out.push(hi);
+  }
+  return out;
+}
+
+async function processChunkInline(audioData, sampleRate, chunkIndex, total, fftSize, threshold, timeOffset, mode, algorithm, harmRej){
   const audioArray = audioData instanceof Float32Array ? audioData : new Float32Array(audioData);
   const isCQT = (mode === 'cqt');
   const frameSize = Math.max(1024, isCQT ? Math.max(fftSize, 16384) : (fftSize|0));
   const hopSize   = isCQT ? Math.max(128, Math.floor(frameSize/8)) : Math.floor(frameSize/2);
   const maxHarm   = isCQT ? 8 : 6;
   const { tables, window } = buildHarmonicTables(sampleRate, maxHarm, frameSize);
-  const maxPolyphony = 16;
+  const nBins = frameSize/2;
 
   const numFrames = Math.max(0, Math.floor((audioArray.length - frameSize)/hopSize));
   const re = new Float32Array(frameSize);
@@ -539,124 +636,77 @@ async function processChunkInline(audioData, sampleRate, chunkIndex, total, fftS
   const framesMag = [];
   const notesOut=[];
   const salRows=[];
+  const allFrames=[];
 
-  // First pass: compute frames mags and base salience rows (for velocity)
-  const allFrames = [];
+  // First pass
   for (let f=0; f<numFrames; f++){
-    const start = f*hopSize;
-    const frame = applyWindow(audioArray.subarray(start, start+frameSize), window);
+    const start=f*hopSize;
+    const frame=applyWindow(audioArray.subarray(start,start+frameSize), window);
     allFrames.push(frame);
     re.set(frame); im.fill(0); fftRadix2(re, im);
-    const mags = new Float32Array(frameSize/2);
-    for (let k=0;k<mags.length;k++){ const rr=re[k], ii=im[k]; mags[k]=Math.hypot(rr,ii); }
+    const mags=new Float32Array(nBins);
+    for (let k=0;k<nBins;k++){ const rr=re[k], ii=im[k]; mags[k]=Math.hypot(rr,ii); }
     framesMag.push(mags);
 
-    // quick harmonic-sum salience for velocity normalization
-    const sal = new Float32Array(MIDI_MAX-MIDI_MIN+1);
-    let maxSal=0;
+    const sal=new Float32Array(MIDI_MAX-MIDI_MIN+1); let maxSal=0;
     for (let idx=0; idx<tables.length; idx++){
       const hs=tables[idx].harmonics; let s=0;
       for (let h=0; h<hs.length; h++){ const {k,coeff}=hs[h]; s += (1/k) * goertzelPower(frame, coeff); }
       sal[idx]=s; if (s>maxSal) maxSal=s;
     }
-    const row = new Uint8Array(sal.length);
-    if (maxSal>0){ for (let i=0;i<sal.length;i++){ row[i]=Math.max(0,Math.min(255, Math.round(255*sal[i]/maxSal))); } }
+    const row=new Uint8Array(sal.length);
+    if (maxSal>0){ for (let i=0;i<sal.length;i++) row[i]=Math.max(0,Math.min(255, Math.round(255*sal[i]/maxSal))); }
     salRows.push(row);
   }
+  const hopSec = hopSize / sampleRate;
 
-  const hopSec = hopSize/sampleRate;
-
-  function localTimeMedian(bin, fi){
-    let acc=[];
-    for (let t=Math.max(0,fi-2); t<=Math.min(numFrames-1, fi+2); t++) acc.push(framesMag[t][bin]);
-    acc.sort((a,b)=>a-b);
-    return acc[Math.floor(acc.length/2)]||0;
-  }
-  function medianFilterFreq(vec, win=7){
-    const out=new Float32Array(vec.length); const half=(win|0)>>1;
-    for (let k=0;k<vec.length;k++){
-      const a=[]; for (let j=Math.max(0,k-half); j<=Math.min(vec.length-1,k+half); j++) a.push(vec[j]);
-      a.sort((x,y)=>x-y); out[k]=a[Math.floor(a.length/2)]||0;
-    }
-    return out;
-  }
-  function hpsOnSpectrum(spec, maxFactor=4){
-    const n=spec.length; const out=new Float32Array(n);
-    for (let i=1;i<n;i++){
-      let prod=spec[i];
-      for (let f=2; f<=maxFactor; f++){
-        const idx=Math.floor(i/f); if (idx>0) prod *= spec[idx];
-      }
-      out[i]=prod;
-    }
-    return out;
-  }
-  function specBinToMidi(bin, sr){ const freq = bin*sr/(2*(framesMag[0].length)); return Math.round(69+12*Math.log2(freq/440)); }
-
-  // Algorithm branches
+  // Per-frame detection
   for (let f=0; f<numFrames; f++){
     const time = timeOffset + f*hopSec;
-    const frame = allFrames[f];
-    const mags = framesMag[f];
     const salRow = salRows[f];
-    const frameDur = hopSec;
+    const mags = framesMag[f];
 
-    const isMono = (algorithm==='mono');
-    const isPoly = (algorithm==='poly');
-    const isPolyNew = (algorithm==='poly_new' || algorithm==='hybrid'); // hybrid can benefit too
-    const isRhythm = (algorithm==='rhythm');
+    if (algorithm==='rhythm') continue;
 
-    // Monophonic F0 (YIN)
-    if (isMono){
-      const f0 = yinMono(frame, sampleRate, 40, 5000);
-      if (f0){ const m = Math.round(freqToMidi(f0)); if (m>=MIDI_MIN && m<=MIDI_MAX){
-        const vel = Math.max(10, Math.min(127, Math.round(20 + 0.42*(salRow[m-MIDI_MIN]||0))));
-        notesOut.push({ time, pitch:m, velocity:vel, duration:frameDur });
-      }}
+    if (algorithm==='mono'){
+      const f0 = yinMono(allFrames[f], sampleRate, 40, 5000);
+      if (f0){
+        const m=Math.round(freqToMidi(f0));
+        if (m>=MIDI_MIN && m<=MIDI_MAX){
+          const vel = Math.max(10, Math.min(127, Math.round(20 + 0.42*(salRow[m-MIDI_MIN]||0))));
+          notesOut.push({ time, pitch:m, velocity:vel, duration:hopSec });
+        }
+      }
       continue;
     }
 
-    // Rhythmic handled after loop using spectral flux; skip per-frame
-    if (isRhythm) continue;
+    // Build candidate list for poly / poly_new / hybrid
+    let frameList=[];
 
-    // Polyphonic (original)
-    if (isPoly){
-      // choose k peaks from harmonic-sum salience row
-      const arr = Array.from(salRow);
-      const masked = arr.map(v=>v);
-      const picks=[];
+    if (algorithm==='poly'){
+      const arr=Array.from(salRow);
+      const masked=arr.map(v=>v);
       function isPeak(i){ const L=i>0?masked[i-1]:-1, R=i<masked.length-1?masked[i+1]:-1; return masked[i]>=L && masked[i]>=R; }
-      let count=0, thr= Math.max(30, 0.5*Math.max(...masked));
+      let count=0, thr=Math.max(30, 0.5*Math.max(...masked));
       while (count<16){
         let bi=-1, bv=thr;
-        for (let i=0;i<masked.length;i++){
-          const v=masked[i]; if (v>bv && isPeak(i)){ bi=i; bv=v; }
-        }
+        for (let i=0;i<masked.length;i++){ const v=masked[i]; if (v>bv && isPeak(i)){ bi=i; bv=v; } }
         if (bi<0) break;
         const m = MIDI_MIN + bi;
         const vel = Math.max(10, Math.min(127, Math.round(20 + 0.42*bv)));
-        notesOut.push({ time, pitch:m, velocity:vel, duration:frameDur });
-        // mask harmonics to reduce duplicates
+        frameList.push({pitch:m, velocity:vel});
         for (let h=1; h<=8; h++){
-          const mh = Math.round(m + 12*Math.log2(h));
-          const j = mh - MIDI_MIN;
+          const mh=Math.round(m + 12*Math.log2(h));
+          const j=mh - MIDI_MIN;
           for (let d=-1; d<=1; d++){ const idx=j+d; if (idx>=0 && idx<masked.length) masked[idx]*=0.1; }
         }
         count++;
       }
-      continue;
-    }
-
-    // Poly New: HPSS + HPS + harmonic-sum fusion + subharmonic check + velocity from fused salience
-    if (isPolyNew){
+    } else {
+      // Poly New / Hybrid
       const harm = medianFilterFreq(mags, 9);
       const perc_med = new Float32Array(mags.length);
-      for (let k=0;k<mags.length;k++) perc_med[k] = (function local(frames, bin, fi){
-        let acc=[];
-        for (let t=Math.max(0,fi-2); t<=Math.min(frames.length-1, fi+2); t++) acc.push(frames[t][bin]);
-        acc.sort((a,b)=>a-b);
-        return acc[Math.floor(acc.length/2)]||0;
-      })(framesMag, k, f);
+      for (let k=0;k<mags.length;k++) perc_med[k] = localTimeMedian(framesMag, k, f);
       const harmMask = new Float32Array(mags.length);
       for (let k=0;k<mags.length;k++) harmMask[k] = harm[k] / (harm[k] + perc_med[k] + 1e-9);
       const harmSpec = new Float32Array(mags.length);
@@ -675,19 +725,15 @@ async function processChunkInline(audioData, sampleRate, chunkIndex, total, fftS
       const arr = Array.from(salRow);
       const topS=[]; const tmp=arr.slice();
       for (let k=0;k<10;k++){
-        let bi=-1,bv=0;
-        for (let i=0;i<tmp.length;i++){ if (tmp[i]>bv){ bv=tmp[i]; bi=i; } }
-        if (bi<0) break;
-        topS.push(MIDI_MIN+bi);
-        tmp[bi]=0;
+        let bi=-1,bv=0; for (let i=0;i<tmp.length;i++){ if (tmp[i]>bv){ bv=tmp[i]; bi=i; } }
+        if (bi<0) break; topS.push(MIDI_MIN+bi); tmp[bi]=0;
       }
       const merged = new Set([...candidates, ...topS]);
       const finalCand = new Set();
       merged.forEach(m=>{ if (merged.has(m-12)) finalCand.add(m-12); else finalCand.add(m); });
       const outList=[];
       finalCand.forEach(m=>{
-        const idx=m-MIDI_MIN;
-        const s = arr[idx]||0; if (s<20) return;
+        const idx=m-MIDI_MIN; const s = arr[idx]||0; if (s<20) return;
         const freq = A4*Math.pow(2,(m-69)/12);
         const bin = Math.round(freq * (2*nBins) / sampleRate);
         const hpsVal = (hps[bin]|0);
@@ -695,58 +741,189 @@ async function processChunkInline(audioData, sampleRate, chunkIndex, total, fftS
         const sNorm = Math.min(1, s/255);
         const fused = 0.6*sNorm + 0.4*hpsNorm;
         const vel = Math.max(10, Math.min(127, Math.round(15 + fused*112)));
-        outList.push({m, vel});
+        outList.push({pitch:m, velocity:vel});
       });
-      outList.sort((a,b)=>b.vel-a.vel);
-      const taken = outList.slice(0,16);
-      for (const c of taken) notesOut.push({ time, pitch:c.m, velocity:c.vel, duration:frameDur });
-      continue;
+      outList.sort((a,b)=>b.velocity-a.velocity);
+      frameList = outList.slice(0,16);
     }
 
-    // default: behave like 'poly'
-    const arrD = Array.from(salRow);
-    const maskedD = arrD.map(v=>v);
-    function isPeakD(i){ const L=i>0?maskedD[i-1]:-1, R=i<maskedD.length-1?maskedD[i+1]:-1; return maskedD[i]>=L && maskedD[i]>=R; }
-    let countD=0, thrD= Math.max(30, 0.5*Math.max(...maskedD));
-    while (countD<16){
-      let bi=-1,bv=thrD;
-      for (let i=0;i<maskedD.length;i++){ const v=maskedD[i]; if (v>bv && isPeakD(i)){ bi=i; bv=v; } }
-      if (bi<0) break;
-      const m = MIDI_MIN + bi;
-      const vel = Math.max(10, Math.min(127, Math.round(20 + 0.42*bv)));
-      notesOut.push({ time, pitch:m, velocity:vel, duration:frameDur });
-      for (let h=1; h<=8; h++){
-        const mh = Math.round(m + 12*Math.log2(h));
-        const j = mh - MIDI_MIN;
-        for (let d=-1; d<=1; d++){ const idx=j+d; if (idx>=0 && idx<maskedD.length) maskedD[idx]*=0.1; }
-      }
-      countD++;
+    // Harmonic rejection (new slider)
+    frameList = pruneHarmonics(frameList, harmRej);
+
+    // Push to notesOut
+    for (const c of frameList){
+      notesOut.push({ time, pitch:c.pitch, velocity:c.velocity, duration:hopSec });
     }
   }
 
   if (algorithm==='rhythm'){
-    const onsets = (function spectralFluxOnsets(frames, hopSec){
-      const onsets=[]; let prev=null; const N=frames.length; const flux=new Float32Array(N);
-      for (let i=0;i<N;i++){ const cur=frames[i]; if (!prev){ flux[i]=0; prev=cur; continue; } let s=0; for (let k=0;k<cur.length;k++){ const d=cur[k]-prev[k]; if (d>0) s+=d; } flux[i]=s; prev=cur; }
+    // spectral flux on framesMag
+    const N=framesMag.length; if (N>0){
+      let prev=null; const flux=new Float32Array(N);
+      for (let i=0;i<N;i++){ const cur=framesMag[i]; if (!prev){ flux[i]=0; prev=cur; continue; } let s=0; for (let k=0;k<cur.length;k++){ const d=cur[k]-prev[k]; if (d>0) s+=d; } flux[i]=s; prev=cur; }
       const win=16; const thr=new Float32Array(N);
       for (let i=0;i<N;i++){ const a=[]; for (let j=Math.max(0,i-win); j<Math.min(N,i+win); j++) a.push(flux[j]); a.sort((x,y)=>x-y); thr[i]=a.length? a[Math.floor(a.length*0.6)]*1.2:0; }
-      for (let i=1;i<N-1;i++){ if (flux[i]>thr[i] && flux[i]>=flux[i-1] && flux[i]>=flux[i+1]){ const t=timeOffset + i*hopSec; const vel = Math.max(10, Math.min(127, Math.round(20 + 100*(flux[i]/(thr[i]+1e-9))))); onsets.push({ time:t, pitch:36, velocity:vel, duration:0.1 }); } }
-      return onsets;
-    })(framesMag, hopSec);
-    for (const n of onsets) notesOut.push(n);
+      for (let i=1;i<N-1;i++){ if (flux[i]>thr[i] && flux[i]>=flux[i-1] && flux[i]>=flux[i+1]){
+        const t=timeOffset + i*hopSec; const vel=Math.max(10, Math.min(127, Math.round(20 + 100*(flux[i]/(thr[i]+1e-9))))); notesOut.push({ time:t, pitch:36, velocity:vel, duration:0.1 });
+      }}
+    }
   }
 
-  self.postMessage({ 
-    type: 'progress', 
-    chunkIndex, 
-    totalChunks, 
-    notes: notesOut, 
-    salRows: salRows, 
-    hopSec: hopSec
-  });
-} catch(err){
-  self.postMessage({ type:'error', error: err?.message || String(err) });
-} finally {
-  isProcessing=false;
+  DETECTED_FROM_WORKER.push(...notesOut);
+  if (!SAL_HOP_SEC) SAL_HOP_SEC = hopSec;
+  for (const r of salRows) SAL_ROWS.push(r);
+
+  processedChunks++; const pct=((processedChunks/total)*70+20); updateProgress(pct, `Chunk ${processedChunks}/${total}...`);
 }
+
+// ===== MIDI export & playback =====
+function exportToMIDI(){
+  const notes = applyPostFilters(detectedNotes||[]);
+  if (!notes.length) return showStatus('Nessuna nota da esportare','error');
+  const bpm = ESTIMATED_BPM || 120;
+  const data = buildMIDI(notes, bpm);
+  const blob=new Blob([data],{type:'audio/midi'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a'); a.href=url; a.download='converted.mid'; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+  showStatus('MIDI esportato (BPM stimato: '+Math.round(bpm)+')','success');
+}
+function writeVarLen(arr, v){ let buffer=v & 0x7F; while((v >>= 7)){ buffer <<= 8; buffer |= ((v & 0x7F)|0x80); } while(true){ arr.push(buffer & 0xFF); if (buffer & 0x80) buffer >>= 8; else break; } }
+function buildMIDI(notes, bpm){
+  const TPQ=480, mpqn=Math.round(60000000/Math.max(30,Math.min(300,bpm)));
+  const seq=notes.slice().sort((a,b)=>a.time-b.time);
+  const events=[];
+  for (const n of seq){
+    const on=Math.round(n.time*(TPQ*bpm/60));
+    const off=Math.round((n.time+n.duration)*(TPQ*bpm/60));
+    const pitch=Math.max(0,Math.min(127,n.pitch|0));
+    const vel=Math.max(1,Math.min(127),(n.velocity|0)||80);
+    events.push({tick:on,type:'on',pitch,vel});
+    events.push({tick:Math.max(on+1,off),type:'off',pitch,vel:0x40});
+  }
+  events.sort((a,b)=>a.tick-b.tick || (a.type==='off'?-1:1));
+  let last=0; const track=[];
+  track.push(0x00,0xFF,0x51,0x03,(mpqn>>16)&0xFF,(mpqn>>8)&0xFF,mpqn&0xFF);
+  track.push(0x00,0xC0,0x00);
+  for(const ev of events){
+    const delta=ev.tick-last; last=ev.tick; writeVarLen(track, delta);
+    if (ev.type==='on') track.push(0x90, ev.pitch, ev.vel);
+    else track.push(0x80, ev.pitch, 0x40);
+  }
+  track.push(0x00,0xFF,0x2F,0x00);
+  const header=[0x4D,0x54,0x68,0x64, 0x00,0x00,0x00,0x06, 0x00,0x00, 0x00,0x01, 0x01,0xE0];
+  const trkHdr=[0x4D,0x54,0x72,0x6B];
+  const len=track.length; const lenBytes=[(len>>24)&0xFF,(len>>16)&0xFF,(len>>8)&0xFF,len&0xFF];
+  return new Uint8Array([...header, ...trkHdr, ...lenBytes, ...track]).buffer;
+}
+
+function playAudio(){
+  if (!audioBuffer) return;
+  if (!audioContext) audioContext = new (window.AudioContext||window.webkitAudioContext)();
+  if (audioSource) try{audioSource.stop()}catch{}
+  audioSource=audioContext.createBufferSource();
+  audioSource.buffer=audioBuffer;
+  audioSource.playbackRate.value=parseInt((document.getElementById('playbackSpeed')||{}).value||'100')/100;
+  audioSource.connect(audioContext.destination);
+  audioSource.start(0,currentTime);
+  isPlaying=true;
+  const playBtn=document.getElementById('playBtn'); const pauseBtn=document.getElementById('pauseBtn'); const stopBtn=document.getElementById('stopBtn');
+  if (playBtn) playBtn.disabled=true; if (pauseBtn) pauseBtn.disabled=false; if (stopBtn) stopBtn.disabled=false;
+}
+function pauseAudio(){
+  if (audioSource){
+    try{ audioSource.stop(); }catch{}
+    currentTime=0; isPlaying=false;
+    const playBtn=document.getElementById('playBtn'); const pauseBtn=document.getElementById('pauseBtn');
+    if (playBtn) playBtn.disabled=false; if (pauseBtn) pauseBtn.disabled=true;
+  }
+}
+function stopAudio(){
+  if (audioSource){
+    try{ audioSource.stop(); }catch{}
+    currentTime=0; isPlaying=false;
+    const playBtn=document.getElementById('playBtn'); const pauseBtn=document.getElementById('pauseBtn'); const stopBtn=document.getElementById('stopBtn');
+    if (playBtn) playBtn.disabled=false; if (pauseBtn) pauseBtn.disabled=true; if (stopBtn) stopBtn.disabled=true;
+  }
+}
+
+function playMidi(){
+  stopMidi(); // ensure no overlap
+  if (!audioContext) audioContext = new (window.AudioContext||window.webkitAudioContext)();
+  const now = audioContext.currentTime;
+  const notes = applyPostFilters(detectedNotes||[]);
+  const master = audioContext.createGain(); master.gain.value=0.2; master.connect(audioContext.destination);
+  midiOscs=[];
+  for (const n of notes){
+    const osc=audioContext.createOscillator(); osc.type='sine';
+    const f = A4*Math.pow(2,(n.pitch-69)/12);
+    const localGain = audioContext.createGain();
+    const velAmp = Math.pow((n.velocity||80)/127, 1.5); // perceptual mapping
+    localGain.gain.setValueAtTime(0, now + n.time);
+    localGain.gain.linearRampToValueAtTime(velAmp, now + n.time + 0.005);
+    localGain.gain.setValueAtTime(velAmp, now + n.time + Math.max(0.05, n.duration) - 0.005);
+    localGain.gain.linearRampToValueAtTime(0, now + n.time + Math.max(0.05, n.duration));
+    osc.frequency.value = f;
+    osc.connect(localGain).connect(master);
+    try{ osc.start(now + n.time); osc.stop(now + n.time + Math.max(0.05, n.duration)); }catch{}
+    midiOscs.push(osc);
+  }
+  const pm=document.getElementById('playMidiBtn'); const sm=document.getElementById('stopMidiBtn');
+  if (pm) pm.disabled=true; if (sm) sm.disabled=false;
+}
+function stopMidi(){
+  if (!midiOscs.length) return;
+  const t = audioContext ? audioContext.currentTime : 0;
+  for (const osc of midiOscs){
+    try{ osc.stop(t+0.01); }catch{}
+    try{ osc.disconnect(); }catch{}
+  }
+  midiOscs.length=0;
+  const pm=document.getElementById('playMidiBtn'); const sm=document.getElementById('stopMidiBtn');
+  if (pm) pm.disabled=false; if (sm) sm.disabled=true;
+}
+
+// ===== Monophonic YIN (used inline) =====
+function yinMono(frame, sr, fmin=40, fmax=5000){
+  const N=frame.length;
+  const maxLag = Math.min(N-2, Math.floor(sr/fmin));
+  const minLag = Math.max(2, Math.floor(sr/fmax));
+  const diff = new Float32Array(maxLag+1);
+  diff[0]=0;
+  for (let tau=1; tau<=maxLag; tau++){
+    let sum=0;
+    for (let i=0; i<N-tau; i++){
+      const d = frame[i]-frame[i+tau];
+      sum += d*d;
+    }
+    diff[tau]=sum;
+  }
+  const cmnd = new Float32Array(maxLag+1);
+  cmnd[0]=1;
+  let running=0;
+  for (let tau=1; tau<=maxLag; tau++){
+    running += diff[tau];
+    cmnd[tau] = diff[tau] * tau / (running||1e-12);
+  }
+  let tauBest=-1, valBest=1e9;
+  const thresh=0.15;
+  for (let tau=minLag+1; tau<=maxLag; tau++){
+    const v=cmnd[tau];
+    if (v<thresh && v<valBest){
+      valBest=v; tauBest=tau;
+    }
+  }
+  if (tauBest<0){
+    for (let tau=minLag+1; tau<=maxLag; tau++){
+      const v=cmnd[tau]; if (v<valBest){ valBest=v; tauBest=tau; }
+    }
+  }
+  if (tauBest>0){
+    const c=cmnd[tauBest], l=cmnd[tauBest-1], r=cmnd[tauBest+1]||c;
+    const den=(l-2*c+r);
+    const delta = den!==0 ? 0.5*(l-r)/den : 0;
+    const tauR = Math.max(minLag, Math.min(maxLag, tauBest+delta));
+    const f0 = sr / tauR;
+    return f0;
+  }
+  return null;
 }
