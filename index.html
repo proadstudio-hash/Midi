@@ -3,884 +3,133 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Audio to MIDI Converter - Spectral Analysis</title>
+  <title>Audio → MIDI (FFT + Hi‑Res CQT)</title>
   <style>
-    :root {
-  /* Primitive Color Tokens */
-  --color-white: rgba(255, 255, 255, 1);
-  --color-black: rgba(0, 0, 0, 1);
-  --color-cream-50: rgba(252, 252, 249, 1);
-  --color-cream-100: rgba(255, 255, 253, 1);
-  --color-gray-200: rgba(245, 245, 245, 1);
-  --color-gray-300: rgba(167, 169, 169, 1);
-  --color-gray-400: rgba(119, 124, 124, 1);
-  --color-slate-500: rgba(98, 108, 113, 1);
-  --color-brown-600: rgba(94, 82, 64, 1);
-  --color-charcoal-700: rgba(31, 33, 33, 1);
-  --color-charcoal-800: rgba(38, 40, 40, 1);
-  --color-slate-900: rgba(19, 52, 59, 1);
-  --color-teal-300: rgba(50, 184, 198, 1);
-  --color-teal-400: rgba(45, 166, 178, 1);
-  --color-teal-500: rgba(33, 128, 141, 1);
-  --color-teal-600: rgba(29, 116, 128, 1);
-  --color-teal-700: rgba(26, 104, 115, 1);
-  --color-teal-800: rgba(41, 150, 161, 1);
-  --color-red-400: rgba(255, 84, 89, 1);
-  --color-red-500: rgba(192, 21, 47, 1);
-  --color-orange-400: rgba(230, 129, 97, 1);
-  --color-orange-500: rgba(168, 75, 47, 1);
-
-  --color-brown-600-rgb: 94, 82, 64;
-  --color-teal-500-rgb: 33, 128, 141;
-  --color-slate-900-rgb: 19, 52, 59;
-  --color-slate-500-rgb: 98, 108, 113;
-  --color-red-500-rgb: 192, 21, 47;
-  --color-red-400-rgb: 255, 84, 89;
-  --color-orange-500-rgb: 168, 75, 47;
-  --color-orange-400-rgb: 230, 129, 97;
-
-  --color-bg-1: rgba(59, 130, 246, 0.08);
-  --color-bg-2: rgba(245, 158, 11, 0.08);
-  --color-bg-3: rgba(34, 197, 94, 0.08);
-  --color-bg-4: rgba(239, 68, 68, 0.08);
-  --color-bg-5: rgba(147, 51, 234, 0.08);
-  --color-bg-6: rgba(249, 115, 22, 0.08);
-  --color-bg-7: rgba(236, 72, 153, 0.08);
-  --color-bg-8: rgba(6, 182, 212, 0.08);
-
-  --color-background: var(--color-cream-50);
-  --color-surface: var(--color-cream-100);
-  --color-text: var(--color-slate-900);
-  --color-text-secondary: var(--color-slate-500);
-  --color-primary: var(--color-teal-500);
-  --color-primary-hover: var(--color-teal-600);
-  --color-primary-active: var(--color-teal-700);
-  --color-secondary: rgba(var(--color-brown-600-rgb), 0.12);
-  --color-secondary-hover: rgba(var(--color-brown-600-rgb), 0.2);
-  --color-secondary-active: rgba(var(--color-brown-600-rgb), 0.25);
-  --color-border: rgba(var(--color-brown-600-rgb), 0.2);
-  --color-btn-primary-text: var(--color-cream-50);
-  --color-card-border: rgba(var(--color-brown-600-rgb), 0.12);
-  --color-card-border-inner: rgba(var(--color-brown-600-rgb), 0.12);
-  --color-error: var(--color-red-500);
-  --color-success: var(--color-teal-500);
-  --color-warning: var(--color-orange-500);
-  --color-info: var(--color-slate-500);
-  --color-focus-ring: rgba(var(--color-teal-500-rgb), 0.4);
-  --color-select-caret: rgba(var(--color-slate-900-rgb), 0.8);
-
-  --focus-ring: 0 0 0 3px var(--color-focus-ring);
-  --focus-outline: 2px solid var(--color-primary);
-  --status-bg-opacity: 0.15;
-  --status-border-opacity: 0.25;
-
-  --color-success-rgb: 33, 128, 141;
-  --color-error-rgb: 192, 21, 47;
-  --color-warning-rgb: 168, 75, 47;
-  --color-info-rgb: 98, 108, 113;
-
-  --font-family-base: "FKGroteskNeue", "Geist", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  --font-family-mono: "Berkeley Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  --font-size-xs: 11px;
-  --font-size-sm: 12px;
-  --font-size-base: 14px;
-  --font-size-md: 14px;
-  --font-size-lg: 16px;
-  --font-size-xl: 18px;
-  --font-size-2xl: 20px;
-  --font-size-3xl: 24px;
-  --font-size-4xl: 30px;
-  --font-weight-normal: 400;
-  --font-weight-medium: 500;
-  --font-weight-semibold: 550;
-  --font-weight-bold: 600;
-  --line-height-tight: 1.2;
-  --line-height-normal: 1.5;
-  --letter-spacing-tight: -0.01em;
-
-  --space-0: 0;
-  --space-1: 1px;
-  --space-2: 2px;
-  --space-4: 4px;
-  --space-6: 6px;
-  --space-8: 8px;
-  --space-10: 10px;
-  --space-12: 12px;
-  --space-16: 16px;
-  --space-20: 20px;
-  --space-24: 24px;
-  --space-32: 32px;
-
-  --radius-sm: 6px;
-  --radius-base: 8px;
-  --radius-md: 10px;
-  --radius-lg: 12px;
-  --radius-full: 9999px;
-
-  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.02);
-  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
-  --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.04), 0 2px 4px -1px rgba(0, 0, 0, 0.02);
-  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.04), 0 4px 6px -2px rgba(0, 0, 0, 0.02);
-  --shadow-inset-sm: inset 0 1px 0 rgba(255, 255, 255, 0.15), inset 0 -1px 0 rgba(0, 0, 0, 0.03);
-
-  --duration-fast: 150ms;
-  --duration-normal: 250ms;
-  --ease-standard: cubic-bezier(0.16, 1, 0.3, 1);
-
-  --container-sm: 640px;
-  --container-md: 768px;
-  --container-lg: 1024px;
-  --container-xl: 1280px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --color-gray-400-rgb: 119, 124, 124;
-    --color-teal-300-rgb: 50, 184, 198;
-    --color-gray-300-rgb: 167, 169, 169;
-    --color-gray-200-rgb: 245, 245, 245;
-
-    --color-bg-1: rgba(29, 78, 216, 0.15);
-    --color-bg-2: rgba(180, 83, 9, 0.15);
-    --color-bg-3: rgba(21, 128, 61, 0.15);
-    --color-bg-4: rgba(185, 28, 28, 0.15);
-    --color-bg-5: rgba(107, 33, 168, 0.15);
-    --color-bg-6: rgba(194, 65, 12, 0.15);
-    --color-bg-7: rgba(190, 24, 93, 0.15);
-    --color-bg-8: rgba(8, 145, 178, 0.15);
-
-    --color-background: var(--color-charcoal-700);
-    --color-surface: var(--color-charcoal-800);
-    --color-text: var(--color-gray-200);
-    --color-text-secondary: rgba(var(--color-gray-300-rgb), 0.7);
-    --color-primary: var(--color-teal-300);
-    --color-primary-hover: var(--color-teal-400);
-    --color-primary-active: var(--color-teal-800);
-    --color-secondary: rgba(var(--color-gray-400-rgb), 0.15);
-    --color-secondary-hover: rgba(var(--color-gray-400-rgb), 0.25);
-    --color-secondary-active: rgba(var(--color-gray-400-rgb), 0.3);
-    --color-border: rgba(var(--color-gray-400-rgb), 0.3);
-    --color-error: var(--color-red-400);
-    --color-success: var(--color-teal-300);
-    --color-warning: var(--color-orange-400);
-    --color-info: var(--color-gray-300);
-    --color-focus-ring: rgba(var(--color-teal-300-rgb), 0.4);
-    --color-btn-primary-text: var(--color-slate-900);
-    --color-card-border: rgba(var(--color-gray-400-rgb), 0.2);
-    --color-card-border-inner: rgba(var(--color-gray-400-rgb), 0.15);
-    --shadow-inset-sm: inset 0 1px 0 rgba(255, 255, 255, 0.1), inset 0 -1px 0 rgba(0, 0, 0, 0.15);
-    --color-select-caret: rgba(var(--color-gray-200-rgb), 0.8);
-
-    --color-success-rgb: var(--color-teal-300-rgb);
-    --color-error-rgb: var(--color-red-400-rgb);
-    --color-warning-rgb: var(--color-orange-400-rgb);
-    --color-info-rgb: var(--color-gray-300-rgb);
-  }
-}
-
-@font-face {
-  font-family: 'FKGroteskNeue';
-  src: url('https://r2cdn.perplexity.ai/fonts/FKGroteskNeue.woff2') format('woff2');
-}
-
-* {
-  margin: 0;
-  padding: 0;
-  box-sizing: border-box;
-}
-
-body {
-  font-family: var(--font-family-base);
-  background: var(--color-background);
-  color: var(--color-text);
-  line-height: var(--line-height-normal);
-  font-size: var(--font-size-base);
-}
-
-.app-container {
-  max-width: 1400px;
-  margin: 0 auto;
-  padding: var(--space-24);
-}
-
-.header {
-  text-align: center;
-  margin-bottom: var(--space-32);
-}
-
-.header h1 {
-  font-size: var(--font-size-4xl);
-  font-weight: var(--font-weight-bold);
-  color: var(--color-text);
-  margin-bottom: var(--space-8);
-}
-
-.header p {
-  color: var(--color-text-secondary);
-  font-size: var(--font-size-lg);
-}
-
-.upload-section {
-  background: var(--color-surface);
-  border: 2px dashed var(--color-border);
-  border-radius: var(--radius-lg);
-  padding: var(--space-32);
-  text-align: center;
-  margin-bottom: var(--space-24);
-  transition: all var(--duration-normal) var(--ease-standard);
-}
-
-.upload-section.dragover {
-  border-color: var(--color-primary);
-  background: var(--color-bg-1);
-}
-
-.upload-icon {
-  font-size: 48px;
-  margin-bottom: var(--space-16);
-  opacity: 0.5;
-}
-
-.upload-section h2 {
-  font-size: var(--font-size-2xl);
-  margin-bottom: var(--space-8);
-  color: var(--color-text);
-}
-
-.upload-section p {
-  color: var(--color-text-secondary);
-  margin-bottom: var(--space-16);
-}
-
-.file-input-wrapper {
-  position: relative;
-  display: inline-block;
-}
-
-#fileInput {
-  display: none;
-}
-
-.btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: var(--space-12) var(--space-24);
-  border-radius: var(--radius-base);
-  font-size: var(--font-size-base);
-  font-weight: var(--font-weight-medium);
-  cursor: pointer;
-  transition: all var(--duration-normal) var(--ease-standard);
-  border: none;
-  text-decoration: none;
-  gap: var(--space-8);
-}
-
-.btn-primary {
-  background: var(--color-primary);
-  color: var(--color-btn-primary-text);
-}
-
-.btn-primary:hover {
-  background: var(--color-primary-hover);
-}
-
-.btn-secondary {
-  background: var(--color-secondary);
-  color: var(--color-text);
-}
-
-.btn-secondary:hover {
-  background: var(--color-secondary-hover);
-}
-
-.btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
-.file-info {
-  display: none;
-  background: var(--color-bg-3);
-  border: 1px solid var(--color-success);
-  border-radius: var(--radius-base);
-  padding: var(--space-16);
-  margin-top: var(--space-16);
-  text-align: left;
-}
-
-.file-info-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-  gap: var(--space-12);
-}
-
-.file-info-item {
-  display: flex;
-  flex-direction: column;
-}
-
-.file-info-label {
-  font-size: var(--font-size-sm);
-  color: var(--color-text-secondary);
-  margin-bottom: var(--space-4);
-}
-
-.file-info-value {
-  font-weight: var(--font-weight-medium);
-  color: var(--color-text);
-}
-
-.analysis-section {
-  display: none;
-}
-
-.controls-panel {
-  background: var(--color-surface);
-  border: 1px solid var(--color-card-border);
-  border-radius: var(--radius-lg);
-  padding: var(--space-20);
-  margin-bottom: var(--space-24);
-}
-
-.controls-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-16);
-  align-items: center;
-}
-
-.control-group {
-  flex: 1;
-  min-width: 200px;
-}
-
-.control-group label {
-  display: block;
-  font-size: var(--font-size-sm);
-  font-weight: var(--font-weight-medium);
-  color: var(--color-text-secondary);
-  margin-bottom: var(--space-6);
-}
-
-.control-group input[type="range"] {
-  width: 100%;
-  accent-color: var(--color-primary);
-}
-
-.control-value {
-  display: inline-block;
-  margin-left: var(--space-8);
-  font-weight: var(--font-weight-medium);
-  color: var(--color-text);
-}
-
-.playback-controls {
-  display: flex;
-  gap: var(--space-8);
-  align-items: center;
-}
-
-.btn-icon {
-  width: 40px;
-  height: 40px;
-  padding: 0;
-  border-radius: var(--radius-base);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: var(--font-size-xl);
-}
-
-.results-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: var(--space-16);
-  margin-bottom: var(--space-24);
-}
-
-.result-card {
-  background: var(--color-surface);
-  border: 1px solid var(--color-card-border);
-  border-radius: var(--radius-lg);
-  padding: var(--space-20);
-  box-shadow: var(--shadow-sm);
-}
-
-.result-card h3 {
-  font-size: var(--font-size-lg);
-  font-weight: var(--font-weight-semibold);
-  margin-bottom: var(--space-12);
-  color: var(--color-text);
-}
-
-.result-value {
-  font-size: var(--font-size-3xl);
-  font-weight: var(--font-weight-bold);
-  color: var(--color-primary);
-  margin-bottom: var(--space-4);
-}
-
-.result-label {
-  font-size: var(--font-size-sm);
-  color: var(--color-text-secondary);
-}
-
-.visualization-section {
-  background: var(--color-surface);
-  border: 1px solid var(--color-card-border);
-  border-radius: var(--radius-lg);
-  padding: var(--space-20);
-  margin-bottom: var(--space-24);
-}
-
-.visualization-section h3 {
-  font-size: var(--font-size-xl);
-  font-weight: var(--font-weight-semibold);
-  margin-bottom: var(--space-16);
-  color: var(--color-text);
-}
-
-.canvas-container {
-  position: relative;
-  width: 100%;
-  background: var(--color-background);
-  border-radius: var(--radius-base);
-  margin-bottom: var(--space-16);
-  overflow: hidden;
-}
-
-canvas {
-  display: block;
-  width: 100%;
-  height: auto;
-}
-
-.notes-table-container {
-  background: var(--color-surface);
-  border: 1px solid var(--color-card-border);
-  border-radius: var(--radius-lg);
-  padding: var(--space-20);
-  margin-bottom: var(--space-24);
-}
-
-.notes-table-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: var(--space-16);
-}
-
-.notes-table-header h3 {
-  font-size: var(--font-size-xl);
-  font-weight: var(--font-weight-semibold);
-  color: var(--color-text);
-}
-
-.sort-controls {
-  display: flex;
-  gap: var(--space-8);
-}
-
-.sort-btn {
-  padding: var(--space-6) var(--space-12);
-  font-size: var(--font-size-sm);
-}
-
-.notes-table-wrapper {
-  overflow-x: auto;
-  max-height: 400px;
-  overflow-y: auto;
-}
-
-table {
-  width: 100%;
-  border-collapse: collapse;
-}
-
-thead {
-  position: sticky;
-  top: 0;
-  background: var(--color-surface);
-  z-index: 10;
-}
-
-th {
-  text-align: left;
-  padding: var(--space-12);
-  font-size: var(--font-size-sm);
-  font-weight: var(--font-weight-semibold);
-  color: var(--color-text-secondary);
-  border-bottom: 2px solid var(--color-border);
-}
-
-td {
-  padding: var(--space-12);
-  border-bottom: 1px solid var(--color-card-border-inner);
-  font-size: var(--font-size-sm);
-}
-
-tr:hover {
-  background: var(--color-bg-1);
-}
-
-.velocity-bar {
-  display: flex;
-  align-items: center;
-  gap: var(--space-8);
-}
-
-.velocity-bar-inner {
-  height: 6px;
-  background: var(--color-primary);
-  border-radius: var(--radius-full);
-  transition: width var(--duration-fast) var(--ease-standard);
-}
-
-.velocity-bar-bg {
-  flex: 1;
-  height: 6px;
-  background: var(--color-secondary);
-  border-radius: var(--radius-full);
-  overflow: hidden;
-}
-
-.progress-container {
-  display: none;
-  margin: var(--space-16) 0;
-}
-
-.progress-bar {
-  width: 100%;
-  height: 8px;
-  background: var(--color-secondary);
-  border-radius: var(--radius-full);
-  overflow: hidden;
-}
-
-.progress-fill {
-  height: 100%;
-  background: var(--color-primary);
-  border-radius: var(--radius-full);
-  transition: width var(--duration-fast) var(--ease-standard);
-  width: 0%;
-}
-
-.progress-text {
-  text-align: center;
-  margin-top: var(--space-8);
-  font-size: var(--font-size-sm);
-  color: var(--color-text-secondary);
-}
-
-.export-section {
-  text-align: center;
-  padding: var(--space-24);
-  background: var(--color-surface);
-  border: 1px solid var(--color-card-border);
-  border-radius: var(--radius-lg);
-}
-
-.status-message {
-  padding: var(--space-12) var(--space-16);
-  border-radius: var(--radius-base);
-  margin: var(--space-16) 0;
-  font-size: var(--font-size-sm);
-}
-
-.status-success {
-  background: rgba(var(--color-success-rgb), 0.15);
-  color: var(--color-success);
-  border: 1px solid rgba(var(--color-success-rgb), 0.25);
-}
-
-.status-error {
-  background: rgba(var(--color-error-rgb), 0.15);
-  color: var(--color-error);
-  border: 1px solid rgba(var(--color-error-rgb), 0.25);
-}
-
-.status-info {
-  background: rgba(var(--color-info-rgb), 0.15);
-  color: var(--color-info);
-  border: 1px solid rgba(var(--color-info-rgb), 0.25);
-}
-
-.progress-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: flex-start;
-  margin-bottom: var(--space-8);
-}
-
-.progress-info {
-  flex: 1;
-}
-
-.progress-stats {
-  font-size: var(--font-size-xs);
-  color: var(--color-text-secondary);
-  margin-top: var(--space-4);
-}
-
-.btn-sm {
-  padding: var(--space-6) var(--space-12);
-  font-size: var(--font-size-sm);
-}
-
-.memory-indicator {
-  margin-top: var(--space-8);
-  padding: var(--space-8);
-  background: var(--color-bg-2);
-  border-radius: var(--radius-sm);
-  font-size: var(--font-size-xs);
-  color: var(--color-text-secondary);
-}
-
-.status-indicator {
-  display: flex;
-  align-items: center;
-  gap: var(--space-8);
-  padding: var(--space-8) var(--space-16);
-  background: var(--color-surface);
-  border: 1px solid var(--color-card-border);
-  border-radius: var(--radius-base);
-  font-size: var(--font-size-sm);
-}
-
-.status-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background: var(--color-text-secondary);
-  animation: pulse 2s infinite;
-}
-
-.status-dot.idle {
-  background: var(--color-text-secondary);
-  animation: none;
-}
-
-.status-dot.processing {
-  background: var(--color-warning);
-}
-
-.status-dot.completed {
-  background: var(--color-success);
-  animation: none;
-}
-
-.status-dot.error {
-  background: var(--color-error);
-  animation: none;
-}
-
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
-
-@media (max-width: 768px) {
-  .app-container {
-    padding: var(--space-16);
-  }
-  
-  .controls-row {
-    flex-direction: column;
-  }
-  
-  .results-grid {
-    grid-template-columns: 1fr;
-  }
-}
+    :root{
+      --bg:#0f1115; --fg:#eaeef2; --muted:#99a1b3; --accent:#6aa1ff;
+      --accent-2:#b277ff; --border:#2a2f3a; --ok:#40c057; --warn:#fab005; --err:#fa5252;
+    }
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Inter,Arial}
+    h1{font-size:18px;margin:16px 0}
+    .wrap{max-width:1100px;margin:0 auto;padding:20px}
+    .row{display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap}
+    .card{background:#12151c;border:1px solid var(--border);border-radius:12px;padding:16px;flex:1}
+    .controls{display:flex;gap:16px;flex-wrap:wrap}
+    label{display:block;margin-bottom:8px;color:var(--muted)}
+    input[type=range],input[type=number],select{width:200px}
+    .upload{border:1px dashed var(--border);border-radius:12px;padding:16px;text-align:center;cursor:pointer;background:#0d1016}
+    .upload.drag{outline:2px dashed var(--accent)}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+    canvas{width:100%;height:280px;background:#0a0d12;border:1px solid var(--border);border-radius:8px}
+    table{width:100%;border-collapse:collapse}
+    th,td{border-bottom:1px solid var(--border);padding:6px 8px;text-align:left}
+    .progress{height:8px;background:#0b0e14;border-radius:6px;border:1px solid var(--border);overflow:hidden}
+    .bar{height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--accent-2))}
+    .status{display:flex;align-items:center;gap:8px;color:var(--muted);margin-top:8px}
+    .dot{width:10px;height:10px;border-radius:50%;background:#555}
+    .dot.idle{background:#555}.dot.processing{background:var(--warn)}.dot.completed{background:var(--ok)}.dot.error{background:#fa5252}
+    .btn{background:#171b24;border:1px solid var(--border);color:var(--fg);padding:8px 12px;border-radius:8px;cursor:pointer}
+    .btn:disabled{opacity:.5;cursor:default}
+    .pill{padding:2px 8px;border:1px solid var(--border);border-radius:999px;color:var(--muted)}
+    .sidebar{min-width:300px;max-width:340px}
   </style>
 </head>
 <body>
-  <div class="app-container">
-    <header class="header">
-      <h1>Audio to MIDI Converter</h1>
-      <p>Analisi spettrale avanzata con rilevamento automatico di note e velocità</p>
-    </header>
-
-    <div class="upload-section" id="uploadSection">
-      <div class="upload-icon">🎵</div>
-      <h2>Carica il tuo file audio</h2>
-      <p>Trascina qui un file WAV o MP3, oppure clicca per selezionarlo</p>
-      <div class="file-input-wrapper">
-        <input type="file" id="fileInput" accept=".wav,.mp3,audio/wav,audio/mpeg">
-        <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">
-          Seleziona File
-        </button>
-      </div>
-      <div id="warningMessage" class="status-message status-error" style="display: none;"></div>
-      <div class="file-info" id="fileInfo">
-        <div class="file-info-grid">
-          <div class="file-info-item">
-            <span class="file-info-label">Nome File</span>
-            <span class="file-info-value" id="fileName">-</span>
+  <div class="wrap">
+    <h1>Audio → MIDI (FFT + Hi‑Res CQT)</h1>
+    <div class="row">
+      <div class="card sidebar">
+        <div id="uploadSection" class="upload">
+          <div>Trascina qui un file WAV/MP3 o <br><br><input type="file" id="fileInput" accept=".wav,.mp3,audio/*"></div>
+        </div>
+        <div id="fileInfo" style="margin-top:12px;display:none">
+          <div><b id="fileName"></b> <span class="pill" id="fileSize"></span></div>
+          <div>Durata: <b id="fileDuration">-</b> • SR: <b id="sampleRate">-</b></div>
+        </div>
+        <div class="controls" style="margin-top:12px">
+          <div>
+            <label>Soglia rilevamento: <b id="thresholdValue">120</b></label>
+            <input type="range" id="threshold" min="10" max="1000" step="1" value="120">
           </div>
-          <div class="file-info-item">
-            <span class="file-info-label">Dimensione</span>
-            <span class="file-info-value" id="fileSize">-</span>
+          <div>
+            <label>HPF (Hz): <b id="hpfValue">20</b></label>
+            <input type="number" id="hpfInput" min="10" max="10000" step="1" value="20">
           </div>
-          <div class="file-info-item">
-            <span class="file-info-label">Durata</span>
-            <span class="file-info-value" id="fileDuration">-</span>
+          <div>
+            <label>LPF (Hz): <b id="lpfValue">20000</b></label>
+            <input type="number" id="lpfInput" min="100" max="22050" step="1" value="20000">
           </div>
-          <div class="file-info-item">
-            <span class="file-info-label">Sample Rate</span>
-            <span class="file-info-value" id="sampleRate">-</span>
+          <div>
+            <label>Min Velocity: <b id="minVelValue">25</b></label>
+            <input type="number" id="minVelInput" min="1" max="127" step="1" value="25">
+          </div>
+          <div>
+            <label>Min Duration (s): <b id="minDurValue">0.06</b></label>
+            <input type="number" id="minDurInput" min="0.01" max="5" step="0.01" value="0.06">
           </div>
         </div>
-      </div>
-      <div class="progress-container" id="progressContainer">
-        <div class="progress-header">
-          <div class="progress-info">
-            <div class="progress-text" id="progressText">Inizializzazione...</div>
-            <div class="progress-stats">
-              <span id="progressPercent">0%</span> • 
-              <span id="progressTime">0s</span> elapsed • 
-              <span id="progressETA">calculating...</span> remaining
-            </div>
-          </div>
-          <button class="btn btn-secondary btn-sm" id="cancelBtn" style="display: none;">Cancel</button>
-        </div>
-        <div class="progress-bar">
-          <div class="progress-fill" id="progressFill"></div>
-        </div>
-        <div class="memory-indicator" id="memoryIndicator" style="display: none;">
-          <span>Memory: <span id="memoryUsage">--</span></span>
-        </div>
-      </div>
-    </div>
-
-    <div class="analysis-section" id="analysisSection">
-      <div class="controls-panel">
-        <div class="controls-row">
-          <div class="control-group">
+        <div class="controls">
+          <div>
             <label>Analysis Mode</label>
-            <select id="analysisMode" class="form-control">
-              <option value="full">Full Quality (2048 FFT)</option>
-              <option value="fast" selected>Fast Mode (1024 FFT)</option>
-              <option value="fallback">Low Memory (512 FFT)</option>
+            <select id="analysisMode">
+              <option value="full">Full</option>
+              <option value="fast">Fast</option>
+              <option value="fallback">Fallback</option>
+              <option value="cqt">CQT (Hi‑Res)</option>
             </select>
           </div>
-          <div class="status-indicator" id="statusIndicator">
-            <span class="status-dot" id="statusDot"></span>
-            <span id="statusText">Ready</span>
+          <div>
+            <label>Playback speed: <b id="playbackSpeedValue">100%</b></label>
+            <input type="range" id="playbackSpeed" min="50" max="150" step="1" value="100">
           </div>
         </div>
+        <div class="controls" style="margin-top:8px">
+          <button class="btn" id="reanalyzeBtn">🔎 Re‑Analyze</button>
+          <button class="btn" id="exportBtn">💾 Export MIDI</button>
+          <button class="btn" id="cancelBtn" style="display:none">✖️ Cancel</button>
+        </div>
+        <div class="controls" style="margin-top:8px">
+          <button class="btn" id="playBtn" disabled>▶︎ Play</button>
+          <button class="btn" id="pauseBtn" disabled>⏸</button>
+          <button class="btn" id="stopBtn" disabled>⏹</button>
+          <button class="btn" id="playMidiBtn" disabled>🎹 Play MIDI</button>
+          <button class="btn" id="stopMidiBtn" disabled>⏹ MIDI</button>
+        </div>
+        <div class="progress" id="progressContainer" style="margin-top:12px;display:none">
+          <div class="bar" id="progressFill"></div>
+        </div>
+        <div class="status">
+          <span class="dot idle" id="statusDot"></span>
+          <span id="statusText">Pronto</span>
+          <span class="pill" id="progressPercent" style="margin-left:auto">0%</span>
+        </div>
+        <div id="warningMessage" style="margin-top:6px;color:var(--warn);display:none"></div>
       </div>
-      <div class="controls-panel">
-        <div class="controls-row">
-          <div class="playback-controls">
-            <button class="btn btn-icon btn-secondary" id="playBtn" title="Play">
-              ▶
-            </button>
-            <button class="btn btn-icon btn-secondary" id="pauseBtn" title="Pause" disabled>
-              ⏸
-            </button>
-            <button class="btn btn-icon btn-secondary" id="stopBtn" title="Stop" disabled>
-              ⏹
-            </button>
+      <div class="card" style="flex:2">
+        <div class="grid">
+          <div>
+            <label>Waveform</label>
+            <canvas id="waveformCanvas" width="800" height="200"></canvas>
           </div>
-          <div class="control-group">
-            <label>
-              Velocità Riproduzione
-              <span class="control-value" id="playbackSpeedValue">100%</span>
-            </label>
-            <input type="range" id="playbackSpeed" min="50" max="150" value="100" step="25">
-          </div>
-          <div class="control-group">
-            <label>
-              Soglia Rilevamento (più bassa = più note)
-              <span class="control-value" id="thresholdValue">30</span>
-            </label>
-            <input type="range" id="threshold" min="10" max="100" value="30" step="5">
-            <small style="color: var(--color-text-secondary); font-size: var(--font-size-xs);">Note rilevate: <span id="currentNoteCount">--</span></small>
-          </div>
-          <button class="btn btn-primary" id="reanalyzeBtn">
-            Ri-analizza
-          </button>
-        </div>
-      </div>
-
-      <div class="results-grid">
-        <div class="result-card">
-          <h3>BPM Rilevato</h3>
-          <div class="result-value" id="bpmValue">--</div>
-          <div class="result-label">Battiti per minuto</div>
-        </div>
-        <div class="result-card">
-          <h3>Note Rilevate</h3>
-          <div class="result-value" id="notesCount">--</div>
-          <div class="result-label">Note totali (soglia: <span id="thresholdUsed">--</span>)</div>
-        </div>
-        <div class="result-card">
-          <h3>Durata</h3>
-          <div class="result-value" id="trackDuration">--</div>
-          <div class="result-label">Secondi</div>
-        </div>
-        <div class="result-card">
-          <h3>Range Frequenze</h3>
-          <div class="result-value" id="freqRange">--</div>
-          <div class="result-label">Hz</div>
-        </div>
-      </div>
-
-      <div class="visualization-section">
-        <h3>Forma d'Onda</h3>
-        <div class="canvas-container">
-          <canvas id="waveformCanvas" width="1200" height="200"></canvas>
-        </div>
-      </div>
-
-      <div class="visualization-section">
-        <h3>Piano Roll (Note Rilevate)</h3>
-        <div class="canvas-container">
-          <canvas id="pianoRollCanvas" width="1200" height="400"></canvas>
-        </div>
-      </div>
-
-      <div class="notes-table-container">
-        <div class="notes-table-header">
-          <h3>Tabella Note</h3>
-          <div class="sort-controls">
-            <button class="btn btn-secondary sort-btn" onclick="sortNotes('time')">Ordina per Tempo</button>
-            <button class="btn btn-secondary sort-btn" onclick="sortNotes('pitch')">Ordina per Nota</button>
-            <button class="btn btn-secondary sort-btn" onclick="sortNotes('velocity')">Ordina per Velocità</button>
+          <div>
+            <label>Piano Roll (20–20k Hz + tastiera)</label>
+            <canvas id="pianoRollCanvas" width="800" height="400"></canvas>
           </div>
         </div>
-        <div class="notes-table-wrapper">
-          <table id="notesTable">
+        <div style="margin-top:12px">
+          <table>
             <thead>
               <tr>
-                <th>#</th>
-                <th>Tempo (s)</th>
-                <th>Nota</th>
-                <th>Ottava</th>
-                <th>Frequenza (Hz)</th>
-                <th>Durata (s)</th>
-                <th>Velocità</th>
-                <th>Intensità</th>
+                <th>#</th><th>Time (s)</th><th>Note</th><th>Oct</th><th>Freq (Hz)</th><th>Dur (s)</th><th>Vel</th>
               </tr>
             </thead>
-            <tbody id="notesTableBody">
-            </tbody>
+            <tbody id="notesTableBody"></tbody>
           </table>
         </div>
       </div>
-
-      <div class="export-section">
-        <h3 style="margin-bottom: var(--space-16);">Esporta MIDI</h3>
-        <button class="btn btn-primary" id="exportBtn" style="font-size: var(--font-size-lg); padding: var(--space-16) var(--space-32);">
-          📥 Scarica File MIDI
-        </button>
-        <div id="statusMessage"></div>
-      </div>
     </div>
   </div>
-
   <script src="app.js"></script>
 </body>
 </html>
