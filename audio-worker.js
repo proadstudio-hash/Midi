@@ -23,7 +23,7 @@ function midiToFreq(m){ return A4 * Math.pow(2, (m-69)/12); }
 
 function buildHarmonicTables(sampleRate, maxHarm, frameSize){
   const nyq = sampleRate / 2;
-  const window = hannWindow(frameSize);
+  const winBuf = hannWindow(frameSize);
   const tables = [];
   for (let m=MIDI_MIN; m<=MIDI_MAX; m++){
     const f0 = midiToFreq(m);
@@ -36,7 +36,7 @@ function buildHarmonicTables(sampleRate, maxHarm, frameSize){
     }
     tables.push({m, f0, harmonics: hs});
   }
-  return { tables, window };
+  return { tables, winBuf };
 }
 
 function analyzeChunkRobust(payload){
@@ -44,14 +44,14 @@ function analyzeChunkRobust(payload){
   if (isCancelled){ self.postMessage({type:'cancelled'}); return; }
   isProcessing = true;
   try{
-    const audioArray = audioData instanceof Float32Array ? audioData : new Float32Array(audioData);
+    const audioArray = (audioData && audioData.byteLength!==undefined) ? new Float32Array(audioData) : (audioData instanceof Float32Array ? audioData : new Float32Array(audioData||[]));
 
     const isCQT = (mode === 'cqt');
     const frameSize = Math.max(1024, isCQT ? Math.max(fftSize, 16384) : (fftSize|0));
     const hopSize   = isCQT ? Math.max(128, Math.floor(frameSize/8)) : Math.floor(frameSize/2);
     const maxHarm   = isCQT ? 8 : 6;
 
-    const { tables, window } = buildHarmonicTables(sampleRate, maxHarm, frameSize);
+    const { tables, winBuf } = buildHarmonicTables(sampleRate, maxHarm, frameSize);
 
     const t = Math.min(Math.max(threshold || 30, 10), 1000);
     const alpha = Math.min(0.98, 0.15 + ((t-10)/990)*0.83);
@@ -65,7 +65,7 @@ function analyzeChunkRobust(payload){
     for (let f=0; f<numFrames; f++){
       if (isCancelled){ self.postMessage({type:'cancelled'}); return; }
       const start = f*hopSize;
-      const frame = applyWindow(audioArray.subarray(start, start+frameSize), window);
+      const frame = applyWindow(audioArray.subarray(start, start+frameSize), winBuf);
       const frameRMS = rms(frame);
       if (frameRMS < 1e-4){ 
         salienceRows.push(new Uint8Array(MIDI_MAX-MIDI_MIN+1)); 
