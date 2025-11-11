@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Audio → MIDI (FFT + Hi‑Res CQT)</title>
+  <title>Audio → MIDI (Mono / Poly / Rhythm / Hybrid + CQT)</title>
   <style>
     :root{
       --bg:#0f1115; --fg:#eaeef2; --muted:#99a1b3; --accent:#6aa1ff;
@@ -17,7 +17,7 @@
     .card{background:#12151c;border:1px solid var(--border);border-radius:12px;padding:16px;flex:1}
     .controls{display:flex;gap:16px;flex-wrap:wrap}
     label{display:block;margin-bottom:8px;color:var(--muted)}
-    input[type=range],input[type=number],select{width:200px}
+    input[type=range],input[type=number],select{width:220px}
     .upload{border:1px dashed var(--border);border-radius:12px;padding:16px;text-align:center;cursor:pointer;background:#0d1016}
     .upload.drag{outline:2px dashed var(--accent)}
     .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
@@ -32,12 +32,12 @@
     .btn{background:#171b24;border:1px solid var(--border);color:var(--fg);padding:8px 12px;border-radius:8px;cursor:pointer}
     .btn:disabled{opacity:.5;cursor:default}
     .pill{padding:2px 8px;border:1px solid var(--border);border-radius:999px;color:var(--muted)}
-    .sidebar{min-width:300px;max-width:340px}
+    .sidebar{min-width:300px;max-width:360px}
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Audio → MIDI (FFT + Hi‑Res CQT)</h1>
+    <h1>Audio → MIDI (Mono / Poly / Rhythm / Hybrid + CQT)</h1>
     <div class="row">
       <div class="card sidebar">
         <div id="uploadSection" class="upload">
@@ -48,6 +48,26 @@
           <div>Durata: <b id="fileDuration">-</b> • SR: <b id="sampleRate">-</b></div>
         </div>
         <div class="controls" style="margin-top:12px">
+          <div>
+            <label>Algorithm</label>
+            <select id="algorithmSelect">
+              <option value="poly">Polyphonic</option>
+              <option value="mono">Monophonic</option>
+              <option value="rhythm">Rhythmic</option>
+              <option value="hybrid" selected>Hybrid</option>
+            </select>
+          </div>
+          <div>
+            <label>Analysis Mode</label>
+            <select id="analysisMode">
+              <option value="full">Full</option>
+              <option value="fast">Fast</option>
+              <option value="fallback">Fallback</option>
+              <option value="cqt">CQT (Hi‑Res)</option>
+            </select>
+          </div>
+        </div>
+        <div class="controls">
           <div>
             <label>Soglia rilevamento: <b id="thresholdValue">120</b></label>
             <input type="range" id="threshold" min="10" max="1000" step="1" value="120">
@@ -70,15 +90,6 @@
           </div>
         </div>
         <div class="controls">
-          <div>
-            <label>Analysis Mode</label>
-            <select id="analysisMode">
-              <option value="full">Full</option>
-              <option value="fast">Fast</option>
-              <option value="fallback">Fallback</option>
-              <option value="cqt">CQT (Hi‑Res)</option>
-            </select>
-          </div>
           <div>
             <label>Playback speed: <b id="playbackSpeedValue">100%</b></label>
             <input type="range" id="playbackSpeed" min="50" max="150" step="1" value="100">

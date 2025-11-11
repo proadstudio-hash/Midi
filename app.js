@@ -1,4 +1,4 @@
-// Audio → MIDI — Stable Build (FFT + Hi‑Res CQT + Piano + Freq Axis + Filters + Post‑Filters + MIDI Playback)
+// Audio → MIDI — Multi‑Algorithm (Mono / Poly / Rhythm / Hybrid) + Hi‑Res CQT + Filters + Piano + MIDI Playback
 let audioContext=null, audioBuffer=null, filteredBuffer=null;
 let audioSource=null, isPlaying=false, currentTime=0;
 
@@ -6,13 +6,12 @@ let audioWorker=null, isAnalyzing=false, isCancelled=false;
 let analysisStartTime=0, processedChunks=0, totalChunks=0;
 
 let detectedNotes=[];
-let DETECTED_RAW=[];   // store raw detections before post-filters
-let SAL_ROWS=[];       // Uint8 salience rows for duration rebuild
-let SAL_HOP_SEC=null;  // seconds per salience row
+let DETECTED_FROM_WORKER=[];  // raw worker frame‑notes
+let SAL_ROWS=[];              // Uint8 salience rows for duration rebuild
+let SAL_HOP_SEC=null;         // seconds per salience row
 
-let midiPlaying=false, midiMasterGain=null, midiScheduled=[];
+let midiMasterGain=null, midiScheduled=[];
 
-// Modes
 const ANALYSIS_MODES={ full:{fftSize:8192}, fast:{fftSize:4096}, fallback:{fftSize:2048}, cqt:{fftSize:16384} };
 const CHUNK_SIZE=4096*32;
 const MAX_FILE_SIZE_MB=200, WARNING_SIZE_MB=50, MAX_PROCESSING_TIME_SECONDS=900;
@@ -29,17 +28,15 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   if (fileInput) fileInput.addEventListener('change', e=>{ if (e.target.files && e.target.files.length) handleFile(e.target.files[0]); });
 
-  const playBtn=document.getElementById('playBtn');
-  const pauseBtn=document.getElementById('pauseBtn');
-  const stopBtn=document.getElementById('stopBtn');
-  const playMidiBtn=document.getElementById('playMidiBtn');
-  const stopMidiBtn=document.getElementById('stopMidiBtn');
-
-  if (playBtn) playBtn.addEventListener('click', playAudio);
-  if (pauseBtn) pauseBtn.addEventListener('click', pauseAudio);
-  if (stopBtn) stopBtn.addEventListener('click', stopAudio);
-  if (playMidiBtn) playMidiBtn.addEventListener('click', playMidi);
-  if (stopMidiBtn) stopMidiBtn.addEventListener('click', stopMidi);
+  ['playBtn','pauseBtn','stopBtn','playMidiBtn','stopMidiBtn'].forEach(id=>{
+    const el=document.getElementById(id);
+    if (!el) return;
+    if (id==='playBtn') el.addEventListener('click', playAudio);
+    if (id==='pauseBtn') el.addEventListener('click', pauseAudio);
+    if (id==='stopBtn') el.addEventListener('click', stopAudio);
+    if (id==='playMidiBtn') el.addEventListener('click', playMidi);
+    if (id==='stopMidiBtn') el.addEventListener('click', stopMidi);
+  });
 
   const speed=document.getElementById('playbackSpeed');
   if (speed) speed.addEventListener('input', e=>{
@@ -50,15 +47,15 @@ document.addEventListener('DOMContentLoaded', () => {
   const thr=document.getElementById('threshold');
   if (thr) thr.addEventListener('input', e=>{ const lbl=document.getElementById('thresholdValue'); if (lbl) lbl.textContent=e.target.value; });
 
-  const hpf=document.getElementById('hpfInput');
-  const lpf=document.getElementById('lpfInput');
-  if (hpf) hpf.addEventListener('input', e=>{ const v=e.target.value; const lbl=document.getElementById('hpfValue'); if (lbl) lbl.textContent=v; });
-  if (lpf) lpf.addEventListener('input', e=>{ const v=e.target.value; const lbl=document.getElementById('lpfValue'); if (lbl) lbl.textContent=v; });
-
-  const minVelInput=document.getElementById('minVelInput');
-  const minDurInput=document.getElementById('minDurInput');
-  if (minVelInput) minVelInput.addEventListener('input', e=>{ const v=e.target.value; const lbl=document.getElementById('minVelValue'); if (lbl) lbl.textContent=v; reRenderFiltered(); });
-  if (minDurInput) minDurInput.addEventListener('input', e=>{ const v=e.target.value; const lbl=document.getElementById('minDurValue'); if (lbl) lbl.textContent=v; reRenderFiltered(); });
+  ['hpfInput','lpfInput','minVelInput','minDurInput'].forEach(id=>{
+    const el=document.getElementById(id);
+    const lblMap={hpfInput:'hpfValue', lpfInput:'lpfValue', minVelInput:'minVelValue', minDurInput:'minDurValue'};
+    if (!el) return;
+    el.addEventListener('input', e=>{
+      const v=e.target.value; const lbl=document.getElementById(lblMap[id]); if (lbl) lbl.textContent=v;
+      if (id==='minVelInput' || id==='minDurInput') reRenderFiltered();
+    });
+  });
 
   const reanalyze=document.getElementById('reanalyzeBtn');
   if (reanalyze) reanalyze.addEventListener('click', async ()=>{
@@ -78,7 +75,9 @@ document.addEventListener('DOMContentLoaded', () => {
   if (cancelBtn) cancelBtn.addEventListener('click', cancelAnalysis);
 
   const modeSel=document.getElementById('analysisMode');
-  if (modeSel) modeSel.addEventListener('change', ()=>{ if (audioBuffer && !isAnalyzing) (document.getElementById('reanalyzeBtn')||{}).click?.(); });
+  const algoSel=document.getElementById('algorithmSelect');
+  if (modeSel) modeSel.addEventListener('change', ()=>{ if (audioBuffer && !isAnalyzing) reanalyze.click(); });
+  if (algoSel) algoSel.addEventListener('change', ()=>{ if (audioBuffer && !isAnalyzing) reanalyze.click(); });
 
   initializeWorker();
   updateStatusIndicator('idle','Pronto');
@@ -134,21 +133,13 @@ function handleFile(file){
       if (fDur) fDur.textContent = formatTime(audioBuffer.duration);
       if (fSR) fSR.textContent = audioBuffer.sampleRate + ' Hz';
 
-      // Enable playback controls
-      const playBtn=document.getElementById('playBtn'); if (playBtn) playBtn.disabled=false;
-      const pauseBtn=document.getElementById('pauseBtn'); if (pauseBtn) pauseBtn.disabled=false;
-      const stopBtn=document.getElementById('stopBtn'); if (stopBtn) stopBtn.disabled=false;
-
-      // Prefilter
       updateProgress(50,'Prefiltri...');
       filteredBuffer = await applyPreFilters(audioBuffer,
         parseFloat((document.getElementById('hpfInput')||{}).value||'20'),
         parseFloat((document.getElementById('lpfInput')||{}).value||'20000'));
 
-      // Draw waveform
       drawWaveform(filteredBuffer);
 
-      // Analysis
       updateProgress(70,'Avvio analisi...');
       const thrV=parseInt((document.getElementById('threshold')||{}).value||'120');
       resetSalience();
@@ -162,11 +153,12 @@ function handleFile(file){
 }
 
 function resetSalience(){ SAL_ROWS=[]; SAL_HOP_SEC=null; }
+function getAlgo(){ return (document.getElementById('algorithmSelect')||{}).value || 'hybrid'; }
 
 async function analyzeAudio(buffer, threshold=120){
   if (isAnalyzing) return showStatus('Analisi già in corso','info');
   try{
-    isAnalyzing=true; isCancelled=false; detectedNotes=[]; analysisStartTime=Date.now();
+    isAnalyzing=true; isCancelled=false; detectedNotes=[]; DETECTED_FROM_WORKER=[]; analysisStartTime=Date.now();
     const prog=document.getElementById('progressContainer'); if (prog) prog.style.display='block';
     const cancel=document.getElementById('cancelBtn'); if (cancel) cancel.style.display='inline-block';
     updateStatusIndicator('processing','Analisi');
@@ -174,15 +166,18 @@ async function analyzeAudio(buffer, threshold=120){
 
     const mode=(document.getElementById('analysisMode')||{}).value||'full';
     const fftSize=(ANALYSIS_MODES[mode]||ANALYSIS_MODES.full).fftSize;
+    const algo = getAlgo();
 
-    await processAudioInChunks(buffer, fftSize, threshold, mode);
+    await processAudioInChunks(buffer, fftSize, threshold, mode, algo);
     if (isCancelled){ handleCancellation(); return; }
 
     updateProgress(90,'Ricostruzione note...');
-    if (SAL_ROWS.length && SAL_HOP_SEC){
-      detectedNotes = buildNotesFromSalience(SAL_ROWS, SAL_HOP_SEC);
+    let built = buildFromWorkerEvents(DETECTED_FROM_WORKER, SAL_HOP_SEC || 0.01);
+    if (!built.length && SAL_ROWS.length && SAL_HOP_SEC){
+      built = buildNotesFromSalience(SAL_ROWS, SAL_HOP_SEC);
     }
-    DETECTED_RAW = detectedNotes.slice();
+    detectedNotes = built;
+    const DETECTED_RAW = detectedNotes.slice();
     detectedNotes = applyPostFilters(DETECTED_RAW);
 
     updateProgress(95,'Rendering...');
@@ -192,7 +187,8 @@ async function analyzeAudio(buffer, threshold=120){
     updateProgress(100,'Completato!');
     updateStatusIndicator('completed','Completato');
     showStatus(`Note trovate: ${detectedNotes.length}`,'success');
-    const playMidiBtn=document.getElementById('playMidiBtn'); if (playMidiBtn) playMidiBtn.disabled = detectedNotes.length===0;
+    document.getElementById('playBtn').disabled=false;
+    document.getElementById('playMidiBtn').disabled=false;
   }catch(err){
     console.error(err);
     showStatus('Errore analisi: '+err.message,'error');
@@ -201,22 +197,22 @@ async function analyzeAudio(buffer, threshold=120){
   }
 }
 
-async function processAudioInChunks(buffer, fftSize, threshold, mode){
+async function processAudioInChunks(buffer, fftSize, threshold, mode, algorithm){
   const data=buffer.getChannelData(0), sr=buffer.sampleRate;
   totalChunks=Math.ceil(data.length/CHUNK_SIZE); processedChunks=0;
   for (let i=0;i<totalChunks;i++){
     if (isCancelled) return;
     const s=i*CHUNK_SIZE, e=Math.min(s+CHUNK_SIZE, data.length);
     const chunk=data.slice(s,e);
-    await processChunkWithWorker(chunk, sr, i, totalChunks, fftSize, threshold, s/sr, mode);
+    await processChunkWithWorker(chunk, sr, i, totalChunks, fftSize, threshold, s/sr, mode, algorithm);
     const elapsed=(Date.now()-analysisStartTime)/1000;
     if (elapsed>MAX_PROCESSING_TIME_SECONDS) throw new Error('Timeout analisi.');
   }
 }
 
-function processChunkWithWorker(audioData, sampleRate, chunkIndex, totalChunks, fftSize, threshold, timeOffset, mode){
+function processChunkWithWorker(audioData, sampleRate, chunkIndex, totalChunks, fftSize, threshold, timeOffset, mode, algorithm){
   return new Promise((resolve,reject)=>{
-    const to=setTimeout(()=>{ cleanup(); reject(new Error('Worker timeout')); }, 90000);
+    const to=setTimeout(()=>{ cleanup(); reject(new Error('Worker timeout')); }, 45000);
     const handler=(e)=>{
       const m=e.data||{};
       if (m.type==='progress' && m.chunkIndex===chunkIndex){
@@ -229,13 +225,12 @@ function processChunkWithWorker(audioData, sampleRate, chunkIndex, totalChunks, 
     };
     function cleanup(){ clearTimeout(to); audioWorker.removeEventListener('message', handler); }
     audioWorker.addEventListener('message', handler);
-    const payload = new Float32Array(audioData); 
-    audioWorker.postMessage({ type:'analyze', data:{ audioData: payload.buffer, sampleRate, chunkIndex, totalChunks, fftSize, threshold, timeOffset, mode } }, [payload.buffer]);
+    audioWorker.postMessage({ type:'analyze', data:{ audioData:Array.from(audioData), sampleRate, chunkIndex, totalChunks, fftSize, threshold, timeOffset, mode, algorithm } });
   });
 }
 
 function handleWorkerProgress(chunkIndex,total,notes,salRows,hopSec){
-  if (notes && notes.length) detectedNotes.push(...notes);
+  if (notes && notes.length){ detectedNotes.push(...notes); DETECTED_FROM_WORKER.push(...notes); }
   if (salRows && salRows.length){
     for (const row of salRows){ try{ SAL_ROWS.push(new Uint8Array(row)); }catch{ SAL_ROWS.push(row); } }
     if (!SAL_HOP_SEC && hopSec) SAL_HOP_SEC = hopSec;
@@ -254,7 +249,7 @@ function resetAnalysisState(){
   if (audioWorker) audioWorker.postMessage({type:'reset'});
 }
 
-// Prefilters (HPF/LPF cascaded)
+// ---- Prefilters (HPF/LPF cascaded) ----
 async function applyPreFilters(buffer, hpfHz=20, lpfHz=20000){
   try{
     const sr=buffer.sampleRate, length=buffer.length;
@@ -271,7 +266,7 @@ async function applyPreFilters(buffer, hpfHz=20, lpfHz=20000){
     const h1=offline.createBiquadFilter(); h1.type='highpass'; h1.frequency.value=HP; h1.Q.value=0.707;
     const h2=offline.createBiquadFilter(); h2.type='highpass'; h2.frequency.value=HP; h2.Q.value=0.707;
     const l1=offline.createBiquadFilter(); l1.type='lowpass';  l1.frequency.value=LP; l1.Q.value=0.707;
-    const l2=offline.createBiquadFilter(); l2.type='lowpass';  l2.frequency.value=LP; l2.Q.value=0.707;
+    const l2=offline.createBiquadFilter();  l2.type='lowpass';  l2.frequency.value=LP; l2.Q.value=0.707;
 
     src.connect(h1).connect(h2).connect(l1).connect(l2).connect(offline.destination);
     src.start();
@@ -283,7 +278,7 @@ async function applyPreFilters(buffer, hpfHz=20, lpfHz=20000){
   }
 }
 
-// Drawing
+// ---- Drawing ----
 function drawWaveform(buffer){
   const c=document.getElementById('waveformCanvas'); if (!c) return; const ctx=c.getContext('2d');
   const w=c.width, h=c.height;
@@ -317,7 +312,6 @@ function drawPianoRoll(notes, duration){
   ctx.clearRect(0,0,width,height);
   ctx.fillStyle='#0a0d12'; ctx.fillRect(0,0,width,height);
 
-  // grid + ticks
   const ticks=[20,50,100,200,500,1000,2000,5000,10000,20000];
   ctx.strokeStyle='#2a2f3a'; ctx.fillStyle='#99a1b3'; ctx.font='11px system-ui'; ctx.textAlign='right'; ctx.textBaseline='middle';
   for(const f of ticks){
@@ -327,7 +321,6 @@ function drawPianoRoll(notes, duration){
     ctx.fillText((f>=1000? (f/1000)+'k' : f)+' Hz', axis-8, y);
   }
 
-  // keyboard strip (MIDI 21..108)
   for(let m=21;m<=108;m++){
     const yC=noteCenterY(m), hH=noteHalfH(m);
     const y=yC-hH, h=2*hH;
@@ -365,7 +358,7 @@ function updateNotesTable(notes){
   });
 }
 
-// Post filters
+// ---- Post filters ----
 function getFilterParams(){
   const minVel = Math.max(1, Math.min(127, parseInt((document.getElementById('minVelInput')||{}).value||'25')));
   const minDur = Math.max(0.001, parseFloat((document.getElementById('minDurInput')||{}).value||'0.06'));
@@ -376,13 +369,42 @@ function applyPostFilters(notes){
   return (notes||[]).filter(n => (n.velocity||0) >= minVel && (n.duration||0) >= minDur);
 }
 function reRenderFiltered(){
-  if (!DETECTED_RAW.length || !audioBuffer) return;
-  detectedNotes = applyPostFilters(DETECTED_RAW);
-  drawPianoRoll(detectedNotes, audioBuffer.duration);
-  updateNotesTable(detectedNotes);
+  if (!detectedNotes.length) return;
+  const filtered = applyPostFilters(detectedNotes);
+  drawPianoRoll(filtered, audioBuffer?.duration||0);
+  updateNotesTable(filtered);
 }
 
-// Build notes from salience rows: adaptive threshold + bridging
+// ---- Duration builders ----
+function buildFromWorkerEvents(events, hopSec){
+  if (!events || !events.length) return [];
+  const byPitch = new Map();
+  for (const ev of events){
+    const p = ev.pitch|0;
+    if (!byPitch.has(p)) byPitch.set(p, []);
+    byPitch.get(p).push({t:ev.time, vel: ev.velocity||100, dur: ev.duration||hopSec});
+  }
+  const notes=[];
+  for (const [p, arr] of byPitch){
+    arr.sort((a,b)=>a.t-b.t);
+    let cur=null;
+    for (const e of arr){
+      if (!cur){ cur={time:e.t, duration:Math.max(e.dur, hopSec), pitch:p, velocity:e.vel}; continue; }
+      const gap = e.t - (cur.time + cur.duration);
+      if (gap <= hopSec*2){
+        const newEnd = Math.max(cur.time+cur.duration, e.t + Math.max(e.dur, hopSec));
+        cur.duration = newEnd - cur.time;
+        cur.velocity = Math.max(cur.velocity, e.vel);
+      } else {
+        notes.push(cur); cur = {time:e.t, duration:Math.max(e.dur, hopSec), pitch:p, velocity:e.vel};
+      }
+    }
+    if (cur) notes.push(cur);
+  }
+  notes.sort((a,b)=>a.time-b.time || a.pitch-b.pitch);
+  return notes;
+}
+
 function buildNotesFromSalience(rows, hopSec){
   const P_MIN=21, P_MAX=108, nP=P_MAX-P_MIN+1;
   const T=rows.length; if (!T) return [];
@@ -423,7 +445,7 @@ function buildNotesFromSalience(rows, hopSec){
   return out;
 }
 
-// Audio playback
+// ---- Audio playback ----
 function playAudio(){
   if (!audioBuffer) return;
   if (!audioContext) audioContext = new (window.AudioContext||window.webkitAudioContext)();
@@ -438,10 +460,9 @@ function playAudio(){
   if (playBtn) playBtn.disabled=true; if (pauseBtn) pauseBtn.disabled=false; if (stopBtn) stopBtn.disabled=false;
 }
 function pauseAudio(){
-  if (audioSource && isPlaying){
+  if (audioSource){
     try{ audioSource.stop(); }catch{}
-    currentTime = 0;
-    isPlaying=false;
+    currentTime=0; isPlaying=false;
     const playBtn=document.getElementById('playBtn'); const pauseBtn=document.getElementById('pauseBtn');
     if (playBtn) playBtn.disabled=false; if (pauseBtn) pauseBtn.disabled=true;
   }
@@ -455,10 +476,11 @@ function stopAudio(){
   }
 }
 
-// MIDI export & playback
-function exportToMIDI(){ detectedNotes = applyPostFilters(DETECTED_RAW.length?DETECTED_RAW:detectedNotes);
-  if (!detectedNotes.length) return showStatus('Nessuna nota da esportare','error');
-  const data = buildMIDI(detectedNotes, 120);
+// ---- MIDI export & playback ----
+function exportToMIDI(){
+  const notes = applyPostFilters(detectedNotes||[]);
+  if (!notes.length) return showStatus('Nessuna nota da esportare','error');
+  const data = buildMIDI(notes, 120);
   const blob=new Blob([data],{type:'audio/midi'});
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a'); a.href=url; a.download='converted.mid'; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
@@ -473,7 +495,7 @@ function buildMIDI(notes, bpm){
     const on=Math.round(n.time*(TPQ*bpm/60));
     const off=Math.round((n.time+n.duration)*(TPQ*bpm/60));
     const pitch=Math.max(0,Math.min(127,n.pitch|0));
-    const vel=Math.max(1,Math.min(127,(n.velocity|0)||80));
+    const vel=Math.max(1,Math.min(127),(n.velocity|0)||80);
     events.push({tick:on,type:'on',pitch,vel});
     events.push({tick:Math.max(on+1,off),type:'off',pitch,vel:0x40});
   }
@@ -487,47 +509,13 @@ function buildMIDI(notes, bpm){
     else track.push(0x80, ev.pitch, 0x40);
   }
   track.push(0x00,0xFF,0x2F,0x00);
-  const header=[0x4D,0x54,0x68,0x64, 0x00,0x00,0x00,0x06, 0x00,0x00, 0x00,0x01, 0x01,0xE0]; // TPQ=480
+  const header=[0x4D,0x54,0x68,0x64, 0x00,0x00,0x00,0x06, 0x00,0x00, 0x00,0x01, 0x01,0xE0];
   const trkHdr=[0x4D,0x54,0x72,0x6B];
   const len=track.length; const lenBytes=[(len>>24)&0xFF,(len>>16)&0xFF,(len>>8)&0xFF,len&0xFF];
   return new Uint8Array([...header, ...trkHdr, ...lenBytes, ...track]).buffer;
 }
 
-// Simple MIDI synth
-function playMidi(){
-  if (!detectedNotes.length) return showStatus('Non ci sono note MIDI','error');
-  if (!audioContext) audioContext = new (window.AudioContext||window.webkitAudioContext)();
-  stopMidi();
-  midiMasterGain=audioContext.createGain(); midiMasterGain.gain.value=0.08; midiMasterGain.connect(audioContext.destination);
-  const rate=parseInt((document.getElementById('playbackSpeed')||{}).value||'100')/100;
-  const now=audioContext.currentTime;
-  for (const n of detectedNotes){
-    const start=now + (n.time / rate);
-    const dur=Math.max(0.03, n.duration / rate);
-    const g=audioContext.createGain();
-    g.gain.setValueAtTime(0, start);
-    g.gain.linearRampToValueAtTime(Math.min(1,(n.velocity||80)/127), start+0.005);
-    g.gain.setTargetAtTime(0, start+dur-0.01, 0.01);
-    const osc=audioContext.createOscillator();
-    osc.type='sine'; osc.frequency.value=A4*Math.pow(2,(n.pitch-69)/12);
-    osc.connect(g).connect(midiMasterGain);
-    osc.start(start); osc.stop(start+dur+0.05);
-    midiScheduled.push({osc,g});
-  }
-  const playMidiBtn=document.getElementById('playMidiBtn'); const stopMidiBtn=document.getElementById('stopMidiBtn');
-  if (playMidiBtn) playMidiBtn.disabled=true; if (stopMidiBtn) stopMidiBtn.disabled=false;
-}
-function stopMidi(){
-  for(const o of midiScheduled){ try{o.osc.stop()}catch{} try{o.g.disconnect()}catch{} }
-  midiScheduled=[];
-  if (midiMasterGain){ try{midiMasterGain.disconnect()}catch{} midiMasterGain=null; }
-  const playMidiBtn=document.getElementById('playMidiBtn'); const stopMidiBtn=document.getElementById('stopMidiBtn');
-  if (playMidiBtn) playMidiBtn.disabled=false; if (stopMidiBtn) stopMidiBtn.disabled=true;
-}
-
-// Helpers
-function midiToNote(m){ return A4*Math.pow(2,(m-69)/12); }
-function noteName(m){ const i=m%12, o=Math.floor(m/12)-1; return NOTE_NAMES[i]+o; }
+function noteName(m){ const i=m%12; return ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][i]; }
 function formatFileSize(bytes){ const s=['B','KB','MB','GB']; if(!bytes) return '0 B'; const i=Math.floor(Math.log(bytes)/Math.log(1024)); return (bytes/Math.pow(1024,i)).toFixed(1)+' '+s[i]; }
 function formatTime(sec){ const m=Math.floor(sec/60), s=Math.floor(sec%60); return `${m}:${String(s).padStart(2,'0')}`; }
 
@@ -535,11 +523,3 @@ function updateStatusIndicator(state,text){ const d=document.getElementById('sta
 function updateProgress(pct,label){ const bar=document.getElementById('progressFill'); const cont=document.getElementById('progressContainer'); if (cont) cont.style.display='block'; if (bar) bar.style.width=Math.max(0,Math.min(100,pct))+'%'; const pr=document.getElementById('progressPercent'); if (pr) pr.textContent=Math.round(pct)+'%'; }
 function showStatus(msg, level='info'){ const w=document.getElementById('warningMessage'); if (!w) return; w.textContent=msg; w.style.display='block'; w.style.color=(level==='success')?'#40c057':(level==='error'?'#fa5252':'#fab005'); setTimeout(()=>{w.style.display='none'}, 6000); }
 function showWarn(m){ const w=document.getElementById('warningMessage'); if (!w) return; w.textContent='⚠️ '+m; w.style.color='#fab005'; w.style.display='block'; setTimeout(()=>{w.style.display='none'}, 6000); }
-
-
-function handleCancellation(){
-  isCancelled = false;
-  updateStatusIndicator('idle','Annullato');
-  const cancel=document.getElementById('cancelBtn'); if (cancel) cancel.style.display='none';
-  const prog=document.getElementById('progressContainer'); if (prog) prog.style.display='none';
-}
