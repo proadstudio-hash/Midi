@@ -64,7 +64,9 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   const harm=document.getElementById('harmFilter');
+  const specInt=document.getElementById('spectralIntensity');
   if (harm) harm.addEventListener('input', e=>{ const lbl=document.getElementById('harmFilterValue'); if (lbl) lbl.textContent=e.target.value+'%'; });
+  if (specInt) specInt.addEventListener('input', e=>{ const lbl=document.getElementById('spectralIntensityValue'); if (lbl) lbl.textContent=e.target.value; });
 
   const reanalyze=document.getElementById('reanalyzeBtn');
   if (reanalyze) reanalyze.addEventListener('click', async ()=>{
@@ -168,6 +170,7 @@ function handleFile(file){
 function resetSalience(){ SAL_ROWS=[]; SAL_HOP_SEC=null; }
 function getAlgo(){ return (document.getElementById('algorithmSelect')||{}).value || 'hybrid'; }
 function getHarmReject(){ const v=parseInt((document.getElementById('harmFilter')||{}).value||'70'); return Math.max(0,Math.min(100,v))/100; }
+function getSpectralIntensity(){ return Math.max(10, Math.min(255, parseInt((document.getElementById('spectralIntensity')||{}).value||'140'))); }
 
 // ===== Analysis orchestrator =====
 async function analyzeAudio(buffer, threshold=120){
@@ -188,9 +191,15 @@ async function analyzeAudio(buffer, threshold=120){
     if (isCancelled){ handleCancellation(); return; }
 
     updateProgress(90,'Ricostruzione note...');
-    let built = buildFromWorkerEvents(DETECTED_FROM_WORKER, SAL_HOP_SEC || 0.01);
-    if (!built.length && SAL_ROWS.length && SAL_HOP_SEC){
-      built = buildNotesFromSalience(SAL_ROWS, SAL_HOP_SEC);
+    let built;
+    const algoNow = getAlgo();
+    if (algoNow==='spectral' && SAL_ROWS.length && (SAL_HOP_SEC||0)){
+      built = buildNotesFromSpectral(SAL_ROWS, SAL_HOP_SEC, getSpectralIntensity());
+    } else {
+      built = buildFromWorkerEvents(DETECTED_FROM_WORKER, SAL_HOP_SEC || 0.01);
+      if (!built.length && SAL_ROWS.length && SAL_HOP_SEC){
+        built = buildNotesFromSalience(SAL_ROWS, SAL_HOP_SEC);
+      }
     }
 
     // Velocity refinement from salience energy area (solves "always 100")
@@ -667,121 +676,9 @@ async function processChunkInline(audioData, sampleRate, chunkIndex, total, fftS
     const mags = framesMag[f];
 
     if (algorithm==='rhythm') continue;
+    if (algorithm==='spectral') continue;
 
     if (algorithm==='mono'){
-    if (algorithm==='poly2'){
-      const harm = medianFilterFreq(mags, 9);
-      const perc_med = new Float32Array(mags.length);
-      for (let k=0;k<mags.length;k++) perc_med[k] = localTimeMedian(framesMag, k, f);
-      const harmMask = new Float32Array(mags.length);
-      for (let k=0;k<mags.length;k++) harmMask[k] = harm[k] / (harm[k] + perc_med[k] + 1e-9);
-
-      const logSpec = new Float32Array(mags.length);
-      for (let k=0;k<mags.length;k++) logSpec[k] = Math.log10(1e-9 + mags[k]);
-      const smooth = new Float32Array(mags.length);
-      const wlen = 25, half = (wlen|0)>>1;
-      for (let k=0;k<mags.length;k++){
-        let s=0, c=0;
-        for (let j=k-half;j<=k+half;j++){
-          if (j>=0 && j<logSpec.length){ s += logSpec[j]; c++; }
-        }
-        smooth[k] = s/(c||1);
-      }
-      const white = new Float32Array(mags.length);
-      for (let k=0;k<mags.length;k++) white[k] = Math.max(0, logSpec[k] - smooth[k]);
-
-      const freqPerBin = sampleRate/(2*nBins);
-      function sampleWhite(bin){
-        const i0 = Math.floor(bin);
-        const frac = bin - i0;
-        if (i0<0 || i0>=white.length-1) return 0;
-        return white[i0]*(1-frac) + white[i0+1]*frac;
-      }
-
-      const salLen = MIDI_MAX-MIDI_MIN+1;
-      const salComb = new Float32Array(salLen);
-      let maxSal = 0;
-      const maxH = 8;
-      const centsTol = 15;
-      const detunes = [-centsTol, 0, +centsTol];
-      for (let m=MIDI_MIN; m<=MIDI_MAX; m++){
-        const idx = m - MIDI_MIN;
-        const f0 = A4*Math.pow(2,(m-69)/12);
-        let s = 0;
-        for (let h=1; h<=maxH; h++){
-          const base = f0*h;
-          if (base >= sampleRate*0.5) break;
-          let best = 0;
-          for (let d=0; d<detunes.length; d++){
-            const det = detunes[d];
-            const factor = Math.pow(2, det/1200);
-            const f = base*factor;
-            const bin = f / freqPerBin;
-            const v = sampleWhite(bin);
-            if (v>best) best = v;
-          }
-          const weight = 1.0/h;
-          const b0 = base/freqPerBin;
-          const maskVal = harmMask[Math.min(harmMask.length-1, Math.max(0, Math.round(b0)))];
-          s += weight * best * (0.6 + 0.4*maskVal);
-        }
-        salComb[idx] = s;
-        if (s>maxSal) maxSal = s;
-      }
-      const salRow2 = new Uint8Array(salLen);
-      if (maxSal>0){
-        for (let i=0;i<salLen;i++){
-          salRow2[i] = Math.max(0, Math.min(255, Math.round(255*salComb[i]/maxSal)));
-        }
-      }
-
-      const arr = Array.from(salRow2);
-      const sorted = arr.slice().sort((a,b)=>a-b);
-      const med = sorted[Math.floor(arr.length*0.5)];
-      const p90 = sorted[Math.floor(arr.length*0.9)];
-      let thrLoc = Math.max(30, Math.min(220, Math.floor(med*0.7 + p90*0.3)));
-      const thrParam = Math.max(0, Math.min(1000, threshold|0));
-      const add = Math.floor(thrParam/6);
-      thrLoc = Math.min(240, thrLoc + add);
-
-      const cand = [];
-      function isPeak2(i){ const L=i>0?arr[i-1]:-1, R=i<arr.length-1?arr[i+1]:-1; return arr[i]>=L && arr[i]>=R; }
-      const masked = arr.slice();
-      let found = 0;
-      while (found < 20){
-        let bi=-1, bv=thrLoc;
-        for (let i=0;i<masked.length;i++){ const v=masked[i]; if (v>bv && isPeak2(i)){ bi=i; bv=v; } }
-        if (bi<0) break;
-        const m = MIDI_MIN + bi;
-        const oct = bi-12;
-        if (oct>=0 && masked[oct] > bv*0.85) cand.push(MIDI_MIN + oct);
-        else cand.push(m);
-        for (let h=1; h<=6; h++){
-          const mh = Math.round(m + 12*Math.log2(h));
-          const j = mh - MIDI_MIN;
-          for (let d=-1; d<=1; d++){ const idx=j+d; if (idx>=0 && idx<masked.length) masked[idx]*=0.2; }
-        }
-        for (let d=-1; d<=1; d++){ const idx=bi+d; if (idx>=0 && idx<masked.length) masked[idx]*=0.0; }
-        found++;
-      }
-
-      const uniq = Array.from(new Set(cand));
-      const outList=[];
-      for (const m of uniq){
-        const idx = m - MIDI_MIN;
-        const s = salComb[idx] || 0;
-        const vel = Math.max(10, Math.min(127, Math.round(18 + 109 * (maxSal>0 ? (s/maxSal) : 0))));
-        outList.push({ pitch:m, velocity:vel });
-      }
-      let frameList2 = pruneHarmonics(outList, harmRej);
-      frameList2.sort((a,b)=>b.velocity-a.velocity);
-      frameList = frameList2.slice(0, 20);
-      for (const c of frameList){
-        notesOut.push({ time, pitch:c.pitch, velocity:c.velocity, duration:hopSec });
-      }
-      continue;
-    }
-
       const f0 = yinMono(allFrames[f], sampleRate, 40, 5000);
       if (f0){
         const m=Math.round(freqToMidi(f0));
@@ -1039,4 +936,86 @@ function yinMono(frame, sr, fmin=40, fmax=5000){
     return f0;
   }
   return null;
+}
+
+
+// ===== Spectral builder (from SAL_ROWS heatmap) =====
+function buildNotesFromSpectral(rows, hopSec, intensity){
+  const P_MIN=21, P_MAX=108, nP=P_MAX-P_MIN+1;
+  const T=rows.length; if (!T) return [];
+  const notes=[];
+  const dipsAllowed=2;
+  for(let p=0;p<nP;p++){
+    let t=0;
+    while (t<T){
+      // find start above intensity
+      while (t<T && rows[t][p] < intensity) t++;
+      if (t>=T) break;
+      const on=t; let last=on; t++; let dips=0; let vmax=rows[on][p];
+      while (t<T){
+        const v = rows[t][p];
+        if (v >= intensity){ last=t; dips=0; if (v>vmax) vmax=v; }
+        else { dips++; if (dips>Math.max(1,dipsAllowed)) break; }
+        t++;
+      }
+      const off=last+1;
+      const time=on*hopSec, duration=Math.max(1,off-on)*hopSec;
+      const pitch=P_MIN+p;
+      const velocity = Math.max(10, Math.min(127, Math.round(20 + 0.42*vmax)));
+      notes.push({ time, pitch, velocity, duration });
+    }
+  }
+  // sort and merge close segments of same pitch
+  notes.sort((a,b)=> (a.time-b.time)||(a.pitch-b.pitch));
+  const out=[];
+  for(const n of notes){
+    const prev=out[out.length-1];
+    if (prev && prev.pitch===n.pitch && Math.abs(prev.time+prev.duration - n.time) < hopSec*2){
+      const end=Math.max(prev.time+prev.duration, n.time+n.duration);
+      prev.duration=end-prev.time; prev.velocity=Math.max(prev.velocity, n.velocity);
+    } else out.push(n);
+  }
+  return out;
+}
+
+
+function drawSpectralScope(){
+  const canvas = document.getElementById('spectralScopeCanvas'); if (!canvas) return;
+  const ctx = canvas.getContext('2d'); const w=canvas.width, h=canvas.height;
+  ctx.clearRect(0,0,w,h);
+  const axis=90;
+  ctx.fillStyle='#0a0d12'; ctx.fillRect(0,0,w,h);
+  const fMin=20, fMax=20000;
+  const logMin=Math.log10(fMin), logMax=Math.log10(fMax);
+  const toY=(f)=>{ const lf=Math.log10(Math.max(fMin, Math.min(fMax, f))); return h*(1 - (lf-logMin)/(logMax-logMin)); };
+  // grid
+  const ticks=[20,50,100,200,500,1000,2000,5000,10000,20000];
+  ctx.strokeStyle='#2a2f3a'; ctx.fillStyle='#99a1b3'; ctx.font='11px system-ui'; ctx.textAlign='right'; ctx.textBaseline='middle';
+  for(const f of ticks){ const y=toY(f); ctx.beginPath(); ctx.moveTo(axis,y); ctx.lineTo(w,y); ctx.stroke(); ctx.fillText((f>=1000? (f/1000)+'k' : f)+' Hz', axis-8, y); }
+  if (!SAL_ROWS.length) return;
+  const T=SAL_ROWS.length, P=SAL_ROWS[0].length;
+  const plotW = w-axis;
+  const timeScale = plotW / T;
+  const intensity = getSpectralIntensity();
+  // paint hot bins as rectangles
+  for (let t=0;t<T;t++){
+    const col = SAL_ROWS[t];
+    const x = axis + Math.floor(t*timeScale);
+    for (let p=0;p<P;p++){
+      const v = col[p];
+      if (v < intensity) continue;
+      const midi = 21 + p;
+      const f = 440 * Math.pow(2, (midi-69)/12);
+      const y = Math.floor(toY(f));
+      const f2 = 440 * Math.pow(2, (midi+1-69)/12);
+      const y2 = Math.floor(toY(f2));
+      const yTop = Math.min(y, y2), yBot = Math.max(y, y2);
+      const alpha = Math.min(1, 0.25 + (v-intensity)/255);
+      ctx.fillStyle = `rgba(106,161,255,${alpha})`;
+      ctx.fillRect(x, yTop, Math.max(1, Math.ceil(timeScale)), Math.max(1, yBot-yTop+1));
+    }
+  }
+  // draw threshold legend
+  ctx.fillStyle='#99a1b3';
+  ctx.fillText('Intensity ≥ '+intensity, w-140, 16);
 }
