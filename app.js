@@ -9,6 +9,9 @@ let analysisStartTime=0, processedChunks=0, totalChunks=0;
 let detectedNotes=[];
 let DETECTED_FROM_WORKER=[];
 let SAL_ROWS=[];
+let SAL_HI_ROWS=[]; // hi-res spectral rows
+let SAL_HI_BPO=48; // 48 bins per octave (quarter-tone)
+let SAL_HI_PMIN=21;
 let SAL_HOP_SEC=null;
 
 let ESTIMATED_BPM=120;
@@ -64,9 +67,7 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   const harm=document.getElementById('harmFilter');
-  const specInt=document.getElementById('spectralIntensity');
   if (harm) harm.addEventListener('input', e=>{ const lbl=document.getElementById('harmFilterValue'); if (lbl) lbl.textContent=e.target.value+'%'; });
-  if (specInt) specInt.addEventListener('input', e=>{ const lbl=document.getElementById('spectralIntensityValue'); if (lbl) lbl.textContent=e.target.value; });
 
   const reanalyze=document.getElementById('reanalyzeBtn');
   if (reanalyze) reanalyze.addEventListener('click', async ()=>{
@@ -118,7 +119,7 @@ async function initializeWorker(){
   }
 }
 function workerOnMessage(e){
-  const {type, chunkIndex, totalChunks, notes, salRows, hopSec, error} = e.data || {};
+  const {type, chunkIndex, totalChunks, notes, salRows, salHiRows, hiMeta, hopSec, error} = e.data || {};
   if (type==='progress'){ handleWorkerProgress(chunkIndex, totalChunks, notes||[], salRows||[], hopSec); }
   else if (type==='error'){ showStatus('Worker error: '+error, 'error'); }
 }
@@ -170,7 +171,6 @@ function handleFile(file){
 function resetSalience(){ SAL_ROWS=[]; SAL_HOP_SEC=null; }
 function getAlgo(){ return (document.getElementById('algorithmSelect')||{}).value || 'hybrid'; }
 function getHarmReject(){ const v=parseInt((document.getElementById('harmFilter')||{}).value||'70'); return Math.max(0,Math.min(100,v))/100; }
-function getSpectralIntensity(){ return Math.max(10, Math.min(255, parseInt((document.getElementById('spectralIntensity')||{}).value||'140'))); }
 
 // ===== Analysis orchestrator =====
 async function analyzeAudio(buffer, threshold=120){
@@ -191,15 +191,9 @@ async function analyzeAudio(buffer, threshold=120){
     if (isCancelled){ handleCancellation(); return; }
 
     updateProgress(90,'Ricostruzione note...');
-    let built;
-    const algoNow = getAlgo();
-    if (algoNow==='spectral' && SAL_ROWS.length && (SAL_HOP_SEC||0)){
-      built = buildNotesFromSpectral(SAL_ROWS, SAL_HOP_SEC, getSpectralIntensity());
-    } else {
-      built = buildFromWorkerEvents(DETECTED_FROM_WORKER, SAL_HOP_SEC || 0.01);
-      if (!built.length && SAL_ROWS.length && SAL_HOP_SEC){
-        built = buildNotesFromSalience(SAL_ROWS, SAL_HOP_SEC);
-      }
+    let built = buildFromWorkerEvents(DETECTED_FROM_WORKER, SAL_HOP_SEC || 0.01);
+    if (!built.length && SAL_ROWS.length && SAL_HOP_SEC){
+      built = buildNotesFromSalience(SAL_ROWS, SAL_HOP_SEC);
     }
 
     // Velocity refinement from salience energy area (solves "always 100")
@@ -676,7 +670,6 @@ async function processChunkInline(audioData, sampleRate, chunkIndex, total, fftS
     const mags = framesMag[f];
 
     if (algorithm==='rhythm') continue;
-    if (algorithm==='spectral') continue;
 
     if (algorithm==='mono'){
       const f0 = yinMono(allFrames[f], sampleRate, 40, 5000);
@@ -939,83 +932,127 @@ function yinMono(frame, sr, fmin=40, fmax=5000){
 }
 
 
-// ===== Spectral builder (from SAL_ROWS heatmap) =====
-function buildNotesFromSpectral(rows, hopSec, intensity){
-  const P_MIN=21, P_MAX=108, nP=P_MAX-P_MIN+1;
-  const T=rows.length; if (!T) return [];
-  const notes=[];
-  const dipsAllowed=2;
-  for(let p=0;p<nP;p++){
-    let t=0;
-    while (t<T){
-      // find start above intensity
-      while (t<T && rows[t][p] < intensity) t++;
-      if (t>=T) break;
-      const on=t; let last=on; t++; let dips=0; let vmax=rows[on][p];
-      while (t<T){
-        const v = rows[t][p];
-        if (v >= intensity){ last=t; dips=0; if (v>vmax) vmax=v; }
-        else { dips++; if (dips>Math.max(1,dipsAllowed)) break; }
-        t++;
+// ===== Spectral 2 builder (hi‑res ridge tracking + strong harmonic rejection) =====
+function buildNotesFromSpectralHi(rows, hopSec, intensity, meta, harmRej){
+  const P_MIN = (meta && meta.midiMin) || SAL_HI_PMIN || 21;
+  const BPO   = (meta && meta.bpo) || SAL_HI_BPO || 48; // bins per octave
+  const binsPerSemi = BPO/12;
+  if (!rows || !rows.length) return [];
+  const T = rows.length, P = rows[0].length;
+  const centsTol = 15 + (1-(harmRej||0))*65; // tighter with more rejection
+  const binsTol = Math.max(1, Math.round((centsTol/100)*binsPerSemi));
+
+  // 1) Peak map per frame (NMS within ±1 bin)
+  const peaks = new Array(T);
+  for (let t=0;t<T;t++){
+    const r = rows[t];
+    const pk = [];
+    for (let p=1;p<P-1;p++){
+      const v = r[p];
+      if (v < intensity) continue;
+      if (v >= r[p-1] && v >= r[p+1]) pk.push({p, v});
+    }
+    peaks[t] = pk;
+  }
+
+  // 2) Frame-wise harmonic pruning: remove peaks that are likely harmonics of a stronger, lower peak.
+  function isHarmOf(pHi, pLo){
+    const dBins = pHi - pLo;
+    if (dBins <= 0) return false;
+    for (let n=2;n<=6;n++){
+      const ideal = Math.log2(n) * BPO;
+      if (Math.abs(dBins - ideal) <= binsTol) return true;
+    }
+    return false;
+  }
+  for (let t=0;t<T;t++){
+    const pk = peaks[t];
+    pk.sort((a,b)=>b.v-a.v);
+    const keep=[];
+    for (let i=0;i<pk.length;i++){
+      let harmonic=false;
+      for (let j=0;j<i;j++){
+        if (isHarmOf(pk[i].p, pk[j].p)){ harmonic=true; break; }
       }
-      const off=last+1;
-      const time=on*hopSec, duration=Math.max(1,off-on)*hopSec;
-      const pitch=P_MIN+p;
-      const velocity = Math.max(10, Math.min(127, Math.round(20 + 0.42*vmax)));
-      notes.push({ time, pitch, velocity, duration });
+      if (!harmonic) keep.push(pk[i]);
+    }
+    peaks[t]=keep.sort((a,b)=>a.p-b.p);
+  }
+
+  // 3) Ridge tracking across time (connect nearest peaks within binsTol*1.5)
+  const maxLink = Math.max(1, Math.round(binsTol*1.5));
+  const tracks=[];
+  for (let t=0;t<T;t++){
+    const pk = peaks[t];
+    const used = new Array(pk.length).fill(false);
+    for (let tr of tracks){
+      const last = tr.pts[tr.pts.length-1];
+      if (last.t < t-2) continue;
+      let bestIdx=-1, bestDist=1e9;
+      for (let i=0;i<pk.length;i++){
+        if (used[i]) continue;
+        const dist = Math.abs(pk[i].p - last.p);
+        if (dist <= maxLink && dist < bestDist){ bestDist=dist; bestIdx=i; }
+      }
+      if (bestIdx>=0){
+        used[bestIdx]=true;
+        const pr = pk[bestIdx];
+        tr.pts.push({t, p:pr.p, v:pr.v});
+        tr.pSum += pr.p*pr.v;
+        tr.vSum += pr.v;
+      }
+    }
+    for (let i=0;i<pk.length;i++){
+      if (used[i]) continue;
+      const pr = pk[i];
+      tracks.push({ pts:[{t, p:pr.p, v:pr.v}], pSum:pr.p*pr.v, vSum:pr.v });
     }
   }
-  // sort and merge close segments of same pitch
+
+  function binToFreq(binIdx){
+    const midiFrac = P_MIN + (binIdx / binsPerSemi);
+    return 440 * Math.pow(2, (midiFrac-69)/12);
+  }
+
+  const notes=[];
+  for (const tr of tracks){
+    if (tr.pts.length < 2) continue;
+    let segStart=0;
+    for (let i=1;i<=tr.pts.length;i++){
+      const prev = tr.pts[i-1];
+      const next = tr.pts[i];
+      const gapTooLarge = (!next) || ((next.t - prev.t) > 2);
+      if (gapTooLarge){
+        const pts = tr.pts.slice(segStart, i);
+        if (pts.length >= 2){
+          const t0 = pts[0].t, t1 = pts[pts.length-1].t;
+          const time = t0*hopSec;
+          const duration = (t1 - t0 + 1)*hopSec;
+          let ps=0, vs=0; for (const q of pts){ ps += q.p*q.v; vs += q.v; }
+          const pCent = vs>0 ? ps/vs : pts[Math.floor(pts.length/2)].p;
+          const vsorted = pts.map(q=>q.v).sort((a,b)=>a-b);
+          const p90 = vsorted[Math.floor(vsorted.length*0.9)];
+          const vel = Math.max(10, Math.min(127, Math.round(20 + 0.42*p90)));
+          const f = binToFreq(pCent);
+          const midi = Math.round(69 + 12*Math.log2(f/440));
+          if (midi>=21 && midi<=108){
+            notes.push({ time, duration, pitch:midi, velocity:vel });
+          }
+        }
+        segStart=i;
+      }
+    }
+  }
+
   notes.sort((a,b)=> (a.time-b.time)||(a.pitch-b.pitch));
-  const out=[];
-  for(const n of notes){
-    const prev=out[out.length-1];
-    if (prev && prev.pitch===n.pitch && Math.abs(prev.time+prev.duration - n.time) < hopSec*2){
-      const end=Math.max(prev.time+prev.duration, n.time+n.duration);
-      prev.duration=end-prev.time; prev.velocity=Math.max(prev.velocity, n.velocity);
+  const out=[]; const gapMax=hopSec*2;
+  for (const n of notes){
+    const prev = out[out.length-1];
+    if (prev && prev.pitch===n.pitch && n.time <= (prev.time + prev.duration + gapMax)){
+      const end = Math.max(prev.time+prev.duration, n.time+n.duration);
+      prev.duration = end - prev.time;
+      prev.velocity = Math.max(prev.velocity, n.velocity);
     } else out.push(n);
   }
   return out;
-}
-
-
-function drawSpectralScope(){
-  const canvas = document.getElementById('spectralScopeCanvas'); if (!canvas) return;
-  const ctx = canvas.getContext('2d'); const w=canvas.width, h=canvas.height;
-  ctx.clearRect(0,0,w,h);
-  const axis=90;
-  ctx.fillStyle='#0a0d12'; ctx.fillRect(0,0,w,h);
-  const fMin=20, fMax=20000;
-  const logMin=Math.log10(fMin), logMax=Math.log10(fMax);
-  const toY=(f)=>{ const lf=Math.log10(Math.max(fMin, Math.min(fMax, f))); return h*(1 - (lf-logMin)/(logMax-logMin)); };
-  // grid
-  const ticks=[20,50,100,200,500,1000,2000,5000,10000,20000];
-  ctx.strokeStyle='#2a2f3a'; ctx.fillStyle='#99a1b3'; ctx.font='11px system-ui'; ctx.textAlign='right'; ctx.textBaseline='middle';
-  for(const f of ticks){ const y=toY(f); ctx.beginPath(); ctx.moveTo(axis,y); ctx.lineTo(w,y); ctx.stroke(); ctx.fillText((f>=1000? (f/1000)+'k' : f)+' Hz', axis-8, y); }
-  if (!SAL_ROWS.length) return;
-  const T=SAL_ROWS.length, P=SAL_ROWS[0].length;
-  const plotW = w-axis;
-  const timeScale = plotW / T;
-  const intensity = getSpectralIntensity();
-  // paint hot bins as rectangles
-  for (let t=0;t<T;t++){
-    const col = SAL_ROWS[t];
-    const x = axis + Math.floor(t*timeScale);
-    for (let p=0;p<P;p++){
-      const v = col[p];
-      if (v < intensity) continue;
-      const midi = 21 + p;
-      const f = 440 * Math.pow(2, (midi-69)/12);
-      const y = Math.floor(toY(f));
-      const f2 = 440 * Math.pow(2, (midi+1-69)/12);
-      const y2 = Math.floor(toY(f2));
-      const yTop = Math.min(y, y2), yBot = Math.max(y, y2);
-      const alpha = Math.min(1, 0.25 + (v-intensity)/255);
-      ctx.fillStyle = `rgba(106,161,255,${alpha})`;
-      ctx.fillRect(x, yTop, Math.max(1, Math.ceil(timeScale)), Math.max(1, yBot-yTop+1));
-    }
-  }
-  // draw threshold legend
-  ctx.fillStyle='#99a1b3';
-  ctx.fillText('Intensity ≥ '+intensity, w-140, 16);
 }

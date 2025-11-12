@@ -198,7 +198,31 @@ function analyzeChunkMulti(payload){
       for (let k=0;k<nBins;k++){ const rr=re[k], ii=im[k]; mags[k]=Math.hypot(rr,ii); }
       framesMag.push(mags);
 
-      const sal = new Float32Array(MIDI_MAX-MIDI_MIN+1);
+      // Whitening & helpers for spectral2
+      let white=null, freqPerBin=null;
+      if (algorithm==='spectral2'){
+        const logSpec = new Float32Array(nBins);
+        for (let k=0;k<nBins;k++) logSpec[k] = Math.log10(1e-9 + mags[k]);
+        const smooth = new Float32Array(nBins);
+        const wlen = 25, half = (wlen|0)>>1;
+        for (let k=0;k<nBins;k++){
+          let s=0, c=0;
+          for (let j=k-half;j<=k+half;j++){
+            if (j>=0 && j<logSpec.length){ s += logSpec[j]; c++; }
+          }
+          smooth[k] = s/(c||1);
+        }
+        white = new Float32Array(nBins);
+        for (let k=0;k<nBins;k++) white[k] = Math.max(0, logSpec[k] - smooth[k]);
+        freqPerBin = sampleRate/(2*nBins);
+      }
+      function sampleWhite(bin){
+        if (!white) return 0;
+        const i0 = Math.floor(bin);
+        const frac = bin - i0;
+        if (i0<0 || i0>=white.length-1) return 0;
+        return white[i0]*(1-frac) + white[i0+1]*frac;
+      }\n\n      const sal = new Float32Array(MIDI_MAX-MIDI_MIN+1);
       let maxSal=0;
       for (let idx=0; idx<tables.length; idx++){
         const hs=tables[idx].harmonics; let s=0;
@@ -221,7 +245,6 @@ function analyzeChunkMulti(payload){
       const frameDur = hopSec;
 
       if (algorithm==='rhythm') continue;
-      if (algorithm==='spectral') continue;
 
       if (algorithm==='mono'){
         const f0 = yinMono(frame, sampleRate, 40, 5000);
