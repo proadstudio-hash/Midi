@@ -9,9 +9,6 @@ let analysisStartTime=0, processedChunks=0, totalChunks=0;
 let detectedNotes=[];
 let DETECTED_FROM_WORKER=[];
 let SAL_ROWS=[];
-let SAL_HI_ROWS=[]; // hi-res spectral rows
-let SAL_HI_BPO=48; // 48 bins per octave (quarter-tone)
-let SAL_HI_PMIN=21;
 let SAL_HOP_SEC=null;
 
 let ESTIMATED_BPM=120;
@@ -119,7 +116,7 @@ async function initializeWorker(){
   }
 }
 function workerOnMessage(e){
-  const {type, chunkIndex, totalChunks, notes, salRows, salHiRows, hiMeta, hopSec, error} = e.data || {};
+  const {type, chunkIndex, totalChunks, notes, salRows, hopSec, error} = e.data || {};
   if (type==='progress'){ handleWorkerProgress(chunkIndex, totalChunks, notes||[], salRows||[], hopSec); }
   else if (type==='error'){ showStatus('Worker error: '+error, 'error'); }
 }
@@ -932,126 +929,149 @@ function yinMono(frame, sr, fmin=40, fmax=5000){
 }
 
 
-// ===== Spectral 2 builder (hi‑res ridge tracking + strong harmonic rejection) =====
-function buildNotesFromSpectralHi(rows, hopSec, intensity, meta, harmRej){
-  const P_MIN = (meta && meta.midiMin) || SAL_HI_PMIN || 21;
-  const BPO   = (meta && meta.bpo) || SAL_HI_BPO || 48; // bins per octave
-  const binsPerSemi = BPO/12;
-  if (!rows || !rows.length) return [];
-  const T = rows.length, P = rows[0].length;
-  const centsTol = 15 + (1-(harmRej||0))*65; // tighter with more rejection
-  const binsTol = Math.max(1, Math.round((centsTol/100)*binsPerSemi));
-
-  // 1) Peak map per frame (NMS within ±1 bin)
-  const peaks = new Array(T);
-  for (let t=0;t<T;t++){
-    const r = rows[t];
-    const pk = [];
-    for (let p=1;p<P-1;p++){
-      const v = r[p];
-      if (v < intensity) continue;
-      if (v >= r[p-1] && v >= r[p+1]) pk.push({p, v});
+// ===== Spectral 2 builder (enhanced heatmap + robust harmonic rejection) =====
+function enhanceSalience(rows){
+  const T = rows.length; if (!T) return rows;
+  const P = rows[0].length;
+  const F = new Array(T);
+  for (let t=0; t<T; t++){ const r = rows[t]; const f = new Float32Array(P); for (let p=0;p<P;p++) f[p] = r[p]; F[t]=f; }
+  // Temporal median filter (3)
+  for (let p=0;p<P;p++){
+    for (let t=1; t<T-1; t++){
+      const a=F[t-1][p], b=F[t][p], c=F[t+1][p];
+      const mn=Math.min(a,b,c), mx=Math.max(a,b,c), med=a+b+c-mn-mx;
+      F[t][p]=med;
     }
-    peaks[t] = pk;
   }
-
-  // 2) Frame-wise harmonic pruning: remove peaks that are likely harmonics of a stronger, lower peak.
-  function isHarmOf(pHi, pLo){
-    const dBins = pHi - pLo;
-    if (dBins <= 0) return false;
-    for (let n=2;n<=6;n++){
-      const ideal = Math.log2(n) * BPO;
-      if (Math.abs(dBins - ideal) <= binsTol) return true;
+  // Pitch smoothing (5-tap)
+  for (let t=0;t<T;t++){
+    const f=F[t]; const g=new Float32Array(P);
+    for (let p=0;p<P;p++){
+      let s=0,c=0; for (let q=p-2;q<=p+2;q++){ if (q>=0 && q<P){ s+=f[q]; c++; } }
+      g[p]=s/(c||1);
     }
-    return false;
+    F[t]=g;
+  }
+  // Local contrast via per-pitch median
+  const medPitch = new Float32Array(P);
+  const buf = new Float32Array(T);
+  for (let p=0;p<P;p++){
+    for (let t=0;t<T;t++) buf[t]=F[t][p];
+    const arr=Array.from(buf); arr.sort((a,b)=>a-b);
+    medPitch[p]=arr[Math.floor(T*0.5)]||0;
   }
   for (let t=0;t<T;t++){
-    const pk = peaks[t];
-    pk.sort((a,b)=>b.v-a.v);
-    const keep=[];
-    for (let i=0;i<pk.length;i++){
-      let harmonic=false;
-      for (let j=0;j<i;j++){
-        if (isHarmOf(pk[i].p, pk[j].p)){ harmonic=true; break; }
-      }
-      if (!harmonic) keep.push(pk[i]);
+    const f=F[t];
+    for (let p=0;p<P;p++){
+      let v=f[p]-medPitch[p]*0.85;
+      f[p]=v>0 ? v : 0;
     }
-    peaks[t]=keep.sort((a,b)=>a.p-b.p);
   }
-
-  // 3) Ridge tracking across time (connect nearest peaks within binsTol*1.5)
-  const maxLink = Math.max(1, Math.round(binsTol*1.5));
-  const tracks=[];
+  // Normalize to 0..255
+  let mx=0; for (let t=0;t<T;t++){ for (let p=0;p<P;p++) if (F[t][p]>mx) mx=F[t][p]; }
+  const out = new Array(T);
+  const mxi = mx>0 ? (255/mx) : 1;
+  for (let t=0;t<T;t++){ const f=F[t]; const u=new Uint8Array(P); for (let p=0;p<P;p++) u[p]=Math.max(0, Math.min(255, Math.round(f[p]*mxi))); out[t]=u; }
+  return out;
+}
+function harmonicSuppressFrame(activePitches, heatRow, harmStrength){
+  if (!activePitches.length) return activePitches;
+  activePitches.sort((a,b)=>a-b);
+  const centsTol = 15 + (1-harmStrength)*60;
+  const keep = [];
+  for (let i=0;i<activePitches.length;i++){
+    const mH = activePitches[i];
+    let isHarm=false;
+    for (let j=0;j<i;j++){
+      const mL = activePitches[j];
+      const dSemis = mH - mL; if (dSemis<=0) continue;
+      const ratio = Math.pow(2, dSemis/12);
+      const n = Math.min(8, Math.max(2, Math.round(ratio)));
+      const targetSemis = 12*Math.log2(n);
+      const dCents = Math.abs(dSemis - targetSemis)*100;
+      if (dCents <= centsTol){
+        const idxH = mH-21, idxL = mL-21;
+        const eH = heatRow[idxH]||0, eL = heatRow[idxL]||0;
+        const ratioHL = eH / (eL+1e-6);
+        const limit = 0.70 - 0.45*harmStrength;
+        if (ratioHL < limit){ isHarm=true; break; }
+      }
+    }
+    if (!isHarm) keep.push(mH);
+  }
+  return keep;
+}
+function buildNotesFromSpectral2(rows, hopSec, baseIntensity, harmRej){
+  const P_MIN=21, P_MAX=108, nP=P_MAX-P_MIN+1;
+  const T=rows.length; if (!T) return [];
+  const E = enhanceSalience(rows);
+  // Adaptive per-pitch threshold
+  const thrPerP = new Float32Array(nP);
+  const pitchBuf = new Float32Array(T);
+  for (let p=0;p<nP;p++){
+    for (let t=0;t<T;t++) pitchBuf[t]=E[t][p];
+    const arr=Array.from(pitchBuf); arr.sort((a,b)=>a-b);
+    const med = arr[Math.floor(T*0.5)]||0;
+    const p90 = arr[Math.floor(T*0.9)]||0;
+    const freq = 440*Math.pow(2, ((P_MIN+p)-69)/12);
+    const reg = Math.pow(freq/440, -0.12);
+    const adapt = Math.max(baseIntensity, Math.floor(med*0.7 + p90*0.3));
+    thrPerP[p] = Math.max(10, Math.min(240, Math.round(adapt * reg)));
+  }
+  // Frame-wise selection + NMS + harmonic rejection
+  const active = new Array(T);
   for (let t=0;t<T;t++){
-    const pk = peaks[t];
-    const used = new Array(pk.length).fill(false);
-    for (let tr of tracks){
-      const last = tr.pts[tr.pts.length-1];
-      if (last.t < t-2) continue;
-      let bestIdx=-1, bestDist=1e9;
-      for (let i=0;i<pk.length;i++){
-        if (used[i]) continue;
-        const dist = Math.abs(pk[i].p - last.p);
-        if (dist <= maxLink && dist < bestDist){ bestDist=dist; bestIdx=i; }
-      }
-      if (bestIdx>=0){
-        used[bestIdx]=true;
-        const pr = pk[bestIdx];
-        tr.pts.push({t, p:pr.p, v:pr.v});
-        tr.pSum += pr.p*pr.v;
-        tr.vSum += pr.v;
-      }
+    const heat = E[t];
+    const cand=[];
+    for (let p=0;p<nP;p++){ if (heat[p] >= thrPerP[p]) cand.push(P_MIN+p); }
+    for (let i=1;i<cand.length-1;i++){
+      const pM = cand[i]-P_MIN;
+      const l = E[t][pM-1]||0, c=E[t][pM]||0, r=E[t][pM+1]||0;
+      if (!(c>=l && c>=r)){ cand.splice(i,1); i--; }
     }
-    for (let i=0;i<pk.length;i++){
-      if (used[i]) continue;
-      const pr = pk[i];
-      tracks.push({ pts:[{t, p:pr.p, v:pr.v}], pSum:pr.p*pr.v, vSum:pr.v });
-    }
+    const strong = harmonicSuppressFrame(cand, heat, Math.max(0, Math.min(1, harmRej)));
+    active[t]=strong;
   }
-
-  function binToFreq(binIdx){
-    const midiFrac = P_MIN + (binIdx / binsPerSemi);
-    return 440 * Math.pow(2, (midiFrac-69)/12);
+  // Morphological open/close
+  const binMap = new Array(nP); for (let p=0;p<nP;p++){ binMap[p]=new Uint8Array(T); }
+  for (let t=0;t<T;t++){ for (const m of active[t]){ const idx=m-P_MIN; if (idx>=0 && idx<nP) binMap[idx][t]=1; } }
+  const minDurSec = Math.max(0.001, parseFloat((document.getElementById('minDurInput')||{}).value||'0.06'));
+  const minFrames = Math.max(1, Math.round(minDurSec / hopSec));
+  function erode1d(x, win){ const n=x.length; const y=new Uint8Array(n); const h=(win|0); for (let i=0;i<n;i++){ let ok=1; for (let k=0;k<h;k++){ const j=i+k; if (j>=n || x[j]===0){ ok=0; break;} } y[i]=ok?1:0; } return y; }
+  function dilate1d(x, win){ const n=x.length; const y=new Uint8Array(n); const h=(win|0); for (let i=0;i<n;i++){ let ok=0; for (let k=0;k<h;k++){ const j=i-k; if (j>=0 && x[j]===1){ ok=1; break;} } y[i]=ok?1:0; } return y; }
+  for (let p=0;p<nP;p++){
+    if (!minFrames || minFrames<2) continue;
+    let b = binMap[p];
+    b = dilate1d(erode1d(b, minFrames), minFrames);
+    for (let t=1;t<T-1;t++){ if (b[t]===0 && b[t-1]===1 && b[t+1]===1) b[t]=1; }
+    binMap[p]=b;
   }
-
+  // Build notes
   const notes=[];
-  for (const tr of tracks){
-    if (tr.pts.length < 2) continue;
-    let segStart=0;
-    for (let i=1;i<=tr.pts.length;i++){
-      const prev = tr.pts[i-1];
-      const next = tr.pts[i];
-      const gapTooLarge = (!next) || ((next.t - prev.t) > 2);
-      if (gapTooLarge){
-        const pts = tr.pts.slice(segStart, i);
-        if (pts.length >= 2){
-          const t0 = pts[0].t, t1 = pts[pts.length-1].t;
-          const time = t0*hopSec;
-          const duration = (t1 - t0 + 1)*hopSec;
-          let ps=0, vs=0; for (const q of pts){ ps += q.p*q.v; vs += q.v; }
-          const pCent = vs>0 ? ps/vs : pts[Math.floor(pts.length/2)].p;
-          const vsorted = pts.map(q=>q.v).sort((a,b)=>a-b);
-          const p90 = vsorted[Math.floor(vsorted.length*0.9)];
-          const vel = Math.max(10, Math.min(127, Math.round(20 + 0.42*p90)));
-          const f = binToFreq(pCent);
-          const midi = Math.round(69 + 12*Math.log2(f/440));
-          if (midi>=21 && midi<=108){
-            notes.push({ time, duration, pitch:midi, velocity:vel });
-          }
-        }
-        segStart=i;
-      }
+  for (let p=0;p<nP;p++){
+    const b = binMap[p];
+    let t=0;
+    while (t<T){
+      while (t<T && b[t]===0) t++;
+      if (t>=T) break;
+      const on=t; let last=on; t++;
+      let vmax=E[on][p];
+      while (t<T && b[t]===1){ if (E[t][p]>vmax) vmax=E[t][p]; last=t; t++; }
+      const off=last+1;
+      const time=on*hopSec, duration=Math.max(1,off-on)*hopSec;
+      const pitch=P_MIN+p;
+      const vel=Math.max(10, Math.min(127, Math.round(18 + 109*(vmax/255))));
+      notes.push({ time, pitch, velocity:vel, duration });
     }
   }
-
+  // Merge adjacent segments
   notes.sort((a,b)=> (a.time-b.time)||(a.pitch-b.pitch));
-  const out=[]; const gapMax=hopSec*2;
+  const out=[];
   for (const n of notes){
-    const prev = out[out.length-1];
-    if (prev && prev.pitch===n.pitch && n.time <= (prev.time + prev.duration + gapMax)){
-      const end = Math.max(prev.time+prev.duration, n.time+n.duration);
-      prev.duration = end - prev.time;
-      prev.velocity = Math.max(prev.velocity, n.velocity);
+    const prev=out[out.length-1];
+    if (prev && prev.pitch===n.pitch && n.time - (prev.time+prev.duration) <= 2*hopSec){
+      const end=Math.max(prev.time+prev.duration, n.time+n.duration);
+      prev.duration=end-prev.time; prev.velocity=Math.max(prev.velocity, n.velocity);
     } else out.push(n);
   }
   return out;
